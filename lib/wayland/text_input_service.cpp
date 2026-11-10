@@ -235,6 +235,7 @@ bool TextInputService::activeSurfaceAcceptsTextInput() const noexcept {
 
 void TextInputService::handleEnter(wl_surface* surface) {
   m_enteredSurface = surface;
+  m_enabled = false;
   m_pendingEdit = {};
   m_lastCommittedState.reset();
   if (m_activeClient != nullptr && m_activeSurface == surface) {
