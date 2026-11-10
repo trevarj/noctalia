@@ -41,19 +41,21 @@ void ScaledRenderer::measureTextCursorStops(
 
 void ScaledRenderer::measureTextCursorStopsWrapped(
     std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-    std::vector<TextCursorStop>& outStops, const TextFont& font
+    std::vector<TextCursorStop>& outStops, const TextFont& font, bool useMarkup
 ) {
   assert(m_context != nullptr && "ScaledRenderer wrapped cursor stops without a bound RenderContext");
-  m_context->measureTextCursorStopsWrappedScaled(currentScale(), text, fontSize, byteOffsets, maxWidth, outStops, font);
+  m_context->measureTextCursorStopsWrappedScaled(
+      currentScale(), text, fontSize, byteOffsets, maxWidth, outStops, font, false, useMarkup
+  );
 }
 
 void ScaledRenderer::measureTextCaretStops(
     std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-    std::vector<TextCursorStop>& outStops, const TextFont& font
+    std::vector<TextCursorStop>& outStops, const TextFont& font, bool useMarkup
 ) {
   assert(m_context != nullptr && "ScaledRenderer caret cells without a bound RenderContext");
   m_context->measureTextCursorStopsWrappedScaled(
-      currentScale(), text, fontSize, byteOffsets, maxWidth, outStops, font, true
+      currentScale(), text, fontSize, byteOffsets, maxWidth, outStops, font, true, useMarkup
   );
 }
 

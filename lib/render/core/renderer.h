@@ -52,6 +52,13 @@ struct TextCursorStop {
   // Optional native grapheme cell; zero width means the backend has no cell geometry.
   float cellX = 0.0F;
   float cellWidth = 0.0F;
+  // Required native wrapped-line identity and logical bounds, independent of
+  // the run-specific caret/cell metrics above; same layout origin and scale.
+  int lineIndex = 0;
+  float lineY = 0.0F;
+  float lineHeight = 0.0F;
+  // A caret-only fallback cell, not native painted occupancy.
+  bool cellIsVirtual = false;
 };
 
 struct TextCharSpan {
@@ -80,6 +87,11 @@ struct TextMetrics {
   // Left edge of the leftmost line within maxWidth for wrapped text. Drawn text starts at the draw x, so a
   // caller that needs each line where Pango placed it (e.g. right-aligned RTL paragraphs) offsets by this.
   float alignOffsetX = 0.0F;
+  // Native layout geometry in logical px, without ink or font clipping expansion.
+  // measureText() supplies the first baseline from the layout origin and the
+  // logical layout height; font/glyph-only metrics leave these zero.
+  float layoutBaseline = 0.0F;
+  float layoutHeight = 0.0F;
 };
 
 class Renderer {
@@ -109,17 +121,18 @@ public:
   // Like measureTextCursorStops, but lays the text out wrapped at maxWidth
   // (word-char wrap, '\n' honored — the same layout the draw path uses for a
   // maxLines=0 text node) and reports full caret rects instead of x only.
+  // With useMarkup, byteOffsets index the decoded display text, not the markup.
   virtual void measureTextCursorStopsWrapped(
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-      std::vector<TextCursorStop>& outStops, const TextFont& font = {}
+      std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool useMarkup = false
   ) = 0;
   // Same coordinates as wrapped stops, with grapheme cells for block/underline carets.
   // Kept separate so ordinary line carets do not pay for extra shaping queries.
   virtual void measureTextCaretStops(
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-      std::vector<TextCursorStop>& outStops, const TextFont& font = {}
+      std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool useMarkup = false
   ) {
-    measureTextCursorStopsWrapped(text, fontSize, byteOffsets, maxWidth, outStops, font);
+    measureTextCursorStopsWrapped(text, fontSize, byteOffsets, maxWidth, outStops, font, useMarkup);
   }
   // Horizontal extent of each character on screen: span i covers the bytes from byteOffsets[i] to
   // byteOffsets[i + 1], laid out on one line like measureTextCursorStops. Right-to-left runs put the

@@ -27,7 +27,8 @@ namespace {
     ) override {}
 
     void measureTextCursorStopsWrapped(
-        std::string_view, float, const std::vector<std::size_t>&, float, std::vector<TextCursorStop>&, const TextFont&
+        std::string_view, float, const std::vector<std::size_t>&, float, std::vector<TextCursorStop>&, const TextFont&,
+        bool
     ) override {}
 
     TextMetrics measureGlyph(char32_t, float) override { return TextMetrics{.width = 18.0F}; }

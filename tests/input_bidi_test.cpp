@@ -38,7 +38,9 @@ namespace {
           .top = m.top,
           .bottom = m.bottom,
           .lineCount = m.lineCount,
-          .alignOffsetX = m.alignOffsetX
+          .alignOffsetX = m.alignOffsetX,
+          .layoutBaseline = m.layoutBaseline,
+          .layoutHeight = m.layoutHeight
       };
     }
 
@@ -56,9 +58,9 @@ namespace {
 
     void measureTextCursorStopsWrapped(
         std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-        std::vector<TextCursorStop>& outStops, const TextFont& font
+        std::vector<TextCursorStop>& outStops, const TextFont& font, bool useMarkup
     ) override {
-      m_text.measureCursorStopsWrapped(1.0F, text, fontSize, byteOffsets, maxWidth, outStops, font);
+      m_text.measureCursorStopsWrapped(1.0F, text, fontSize, byteOffsets, maxWidth, outStops, font, false, useMarkup);
     }
 
     void measureTextCharSpans(

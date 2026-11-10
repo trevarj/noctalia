@@ -47,11 +47,11 @@ public:
   ) override;
   void measureTextCursorStopsWrapped(
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-      std::vector<TextCursorStop>& outStops, const TextFont& font = {}
+      std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool useMarkup = false
   ) override;
   void measureTextCaretStops(
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-      std::vector<TextCursorStop>& outStops, const TextFont& font = {}
+      std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool useMarkup = false
   ) override;
   void measureTextCharSpans(
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,

@@ -46,6 +46,9 @@ public:
     int lineCount = 0;      // laid-out line count (0 for empty text)
     // Left edge of the leftmost line within maxWidth; rasterizeLayout crops it.
     float alignOffsetX = 0.0F;
+    // Exact Pango geometry in logical px, independent of ink/clipping extents.
+    float layoutBaseline = 0.0F; // first baseline from layout origin
+    float layoutHeight = 0.0F;   // logical layout height
   };
 
   CairoTextRenderer();
@@ -79,23 +82,33 @@ public:
       float contentScale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,
       std::vector<float>& outStops, const TextFont& font = {}
   );
+  // byteOffsets index decoded layout text when useMarkup is true.
   void measureCursorStopsWrapped(
       float contentScale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,
-      float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool includeCells = false
+      float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font = {}, bool includeCells = false,
+      bool useMarkup = false
   );
   void measureCharSpans(
       float contentScale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,
       std::vector<TextCharSpan>& outSpans, const TextFont& font = {}
   );
 
+  // coverageOnly draws a uniformly tinted glyph mask, excluding markup backgrounds.
   void draw(
       float contentScale, float surfaceWidth, float surfaceHeight, float x, float baselineY, std::string_view text,
       float fontSize, const Color& color, const Mat3& transform, const TextFont& font = {}, float maxWidth = 0.0F,
       int maxLines = 0, TextAlign align = TextAlign::Start, TextEllipsize ellipsize = TextEllipsize::End,
-      bool useMarkup = false
+      bool useMarkup = false, bool coverageOnly = false
   );
 
 private:
+  struct CursorLineBounds {
+    float y;
+    float height;
+  };
+  // Reused per-layout scratch; no line-bound allocation on each cursor query.
+  std::vector<CursorLineBounds> m_cursorLineBounds;
+
   struct CacheKey {
     std::string text;
     TextFont font;
@@ -107,6 +120,7 @@ private:
     TextAlign align = TextAlign::Start;
     TextEllipsize ellipsize = TextEllipsize::End;
     bool useMarkup = false;
+    bool coverageOnly = false;
 
     bool operator==(const CacheKey& other) const noexcept;
   };
@@ -194,15 +208,16 @@ private:
   // Render a layout into a new GL texture; fills out fields of `entry`.
   // When `tinted` is true, rasterizes as CAIRO_FORMAT_A8 and uploads alpha
   // coverage so the color is applied via u_tint at draw time. When false,
-  // rasterizes as CAIRO_FORMAT_ARGB32 with `color` baked in (for COLR emoji
-  // content).
+  // rasterizes as CAIRO_FORMAT_ARGB32 with `color` baked in for default-colored
+  // runs alongside COLR emoji or explicit markup foreground/background colors.
   void rasterizeLayout(float contentScale, PangoLayout* layout, const Color& color, bool tinted, CacheEntry& entry);
   // Extract logical metrics from a laid-out PangoLayout, dividing by PANGO_SCALE and by scale.
   TextMetrics metricsFromLayout(float contentScale, PangoLayout* layout) const;
 
   CacheEntry* lookupOrRasterize(
       float contentScale, std::string_view text, float fontSize, const TextFont& font, float maxWidth, int maxLines,
-      TextAlign align, const Color& color, TextEllipsize ellipsize = TextEllipsize::End, bool useMarkup = false
+      TextAlign align, const Color& color, TextEllipsize ellipsize = TextEllipsize::End, bool useMarkup = false,
+      bool coverageOnly = false
   );
   void touch(CacheMap::iterator it);
   void evict(CacheMap::iterator it);

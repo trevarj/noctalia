@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cmath>
 #include <functional>
+#include <glib.h>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -65,9 +66,6 @@ namespace {
   constexpr float kMultilinePadV = Style::spaceSm;
   constexpr float kWheelScrollLines = 3.0F;
   constexpr float kSelectionLineBreakStubEm = 0.4F;
-  constexpr float kLineYEpsilon = 0.5F;
-
-  bool sameLineY(float a, float b) noexcept { return std::abs(a - b) < kLineYEpsilon; }
 
   float chromeScaleForControlHeight(float controlHeight) noexcept {
     return std::max(0.1F, controlHeight / Style::controlHeight);
@@ -238,17 +236,40 @@ Input::Input() {
     }
   });
   area->setOnPress([this](const InputArea::PointerData& data) {
+    if (data.button == BTN_RIGHT) {
+      m_primaryPointerSelecting = false;
+      if (data.pressed && m_onContextMenu) {
+        auto callback = m_onContextMenu;
+        callback(&data);
+      }
+      return;
+    }
     if (data.pressed) {
-      if (removePreeditText()) {
+      m_primaryPointerSelecting = data.button == BTN_LEFT;
+      const float textStartX = m_horizontalPadding + kTextInnerInset;
+      std::size_t offset = m_multiline
+          ? pointToByteOffset(data.localX - textStartX, data.localY - kMultilinePadV + m_scrollOffsetY)
+          : xToByteOffset(data.localX - textStartX + m_scrollOffset - m_contentLeadSlack);
+      // Hit the painted composition first, then map its replaced range back to the base.
+      if (m_preeditBase || m_preeditLen > 0) {
+        const auto end = m_preeditStart + m_preeditLen;
+        const auto baseEnd = m_preeditBase
+            ? m_preeditBase->value.size() - (m_value.size() - end) : m_preeditStart;
+        if (offset >= end)
+          offset = baseEnd + (offset - end);
+        else if (offset > m_preeditStart)
+          offset = m_preeditStart;
+      }
+      const bool removedPreedit = removePreeditText();
+      offset = clampToUtf8End(m_value, offset);
+      if (removedPreedit) {
         updateDisplayText();
         markTextContentChanged();
+        m_cursorPos = m_selectionAnchor = offset;
+        if (m_renderer != nullptr) doLayout(*m_renderer);
       }
       resetUndoCoalescing();
       m_goalCaretX = -1.0F;
-      const float textStartX = m_horizontalPadding + kTextInnerInset;
-      const std::size_t offset = m_multiline
-          ? pointToByteOffset(data.localX - textStartX, data.localY - kMultilinePadV + m_scrollOffsetY)
-          : xToByteOffset(data.localX - textStartX + m_scrollOffset - m_contentLeadSlack);
       const auto now = std::chrono::steady_clock::now();
       const bool inMultiClickWindow = data.button == BTN_LEFT
           && m_hasLastPrimaryPress
@@ -272,7 +293,8 @@ Input::Input() {
         selectWordAtByteOffset(offset);
         m_pointerSelectPivotStart = selectionStart();
         m_pointerSelectPivotEnd = selectionEnd();
-      } else if (data.button == BTN_LEFT && m_primaryClickCount == 3) {
+      } else if (data.button == BTN_LEFT && m_primaryClickCount == 3 &&
+                 (!m_multiline || multilineStopsValid())) {
         m_pointerSelectGranularity = PointerSelectGranularity::Line;
         selectLineAtByteOffset(offset);
         m_pointerSelectPivotStart = selectionStart();
@@ -290,7 +312,8 @@ Input::Input() {
     }
   });
   area->setOnMotion([this](const InputArea::PointerData& data) {
-    if (m_inputArea != nullptr && m_inputArea->pressed()) {
+    if (m_inputArea != nullptr && m_inputArea->pressed() && m_primaryPointerSelecting) {
+      if (m_textMetricsDirty) return;
       resetUndoCoalescing();
       m_goalCaretX = -1.0F;
       const float textStartX = m_horizontalPadding + kTextInnerInset;
@@ -402,7 +425,7 @@ Input::Input() {
 
   applyVisualState();
   m_paletteConn = paletteChanged().connect([this] {
-    updateDisplayText();
+    refreshDisplayProjection();
     applyVisualState();
   });
   m_inputBordersConn = Style::inputBordersChanged().connect([this] { applyVisualState(); });
@@ -453,6 +476,9 @@ bool Input::editingStateMatches(const EditingState& state) const noexcept {
 void Input::restoreEditingState(const EditingState& state, bool preserveScroll) {
   // Same-document model commands are real caret moves, not buffer switches.
   if (!preserveScroll || state.history != m_editHistory) resetCaretEffects();
+  const bool textChanged = m_value != state.current.value;
+  const auto previousCursor = m_cursorPos;
+  const auto previousAnchor = m_selectionAnchor;
   m_value = state.current.value;
   m_cursorPos = state.current.cursorPos;
   m_selectionAnchor = state.current.selectionAnchor;
@@ -467,8 +493,14 @@ void Input::restoreEditingState(const EditingState& state, bool preserveScroll) 
   }
   clampEditState();
   resetUndoCoalescing();
-  updateDisplayText();
-  markTextContentChanged();
+  if (textChanged) {
+    updateDisplayText();
+    markTextContentChanged();
+  } else {
+    if (m_cursorPos != previousCursor || m_selectionAnchor != previousAnchor)
+      m_revealCursorYPending = true;
+    markLayoutDirty();
+  }
   updateInteractiveGeometry();
   revealCursor();
   notifyTextInputStateChanged(TextInputChangeCause::Other);
@@ -481,6 +513,25 @@ void Input::setOnEditingStateChanged(std::function<void()> callback) {
 
 void Input::setEditValidator(std::function<bool(std::string_view, std::string_view, bool)> validator) {
   m_editValidator = std::move(validator);
+}
+
+void Input::setDisplayProjector(std::function<DisplayProjection(std::string_view)> projector) {
+  m_displayProjector = std::move(projector);
+  refreshDisplayProjection();
+}
+
+void Input::refreshDisplayProjection() {
+  resetCaretEffects();
+  updateDisplayText();
+  markTextContentChanged();
+}
+
+std::size_t Input::projectedWordBoundary(std::size_t rawByte, bool forward) const {
+  return forward ? nextWordEndForByteOffset(rawByte) : previousWordStartForByteOffset(rawByte);
+}
+
+void Input::setEditRewriter(std::function<void(const EditSnapshot&, EditSnapshot&, bool)> rewriter) {
+  m_editRewriter = std::move(rewriter);
 }
 
 void Input::setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs, float strength) {
@@ -532,11 +583,13 @@ void Input::setAnimationManager(AnimationManager* manager) {
 void Input::setFontFamily(std::string family) {
   if (m_label->font().family != family) resetCaretEffects();
   m_label->setFontFamily(std::move(family));
+  m_logicalStrutDirty = true;
   markTextContentChanged();
 }
 void Input::setFontFeatures(std::string features) {
   if (m_label->font().features != features) resetCaretEffects();
   m_label->setFontFeatures(std::move(features));
+  m_logicalStrutDirty = true;
   markTextContentChanged();
 }
 
@@ -558,14 +611,14 @@ void Input::updateClippedText(Renderer& renderer, RectNode* rect, SelectionText&
     clip->setClipChildren(true);
     clip->setHitTestVisible(false);
     auto label = std::make_unique<Label>();
-    label->setUseMarkup(false);
     item.label = static_cast<Label*>(clip->addChild(std::move(label)));
     item.clip = m_textViewport->addChild(std::move(clip));
   }
   item.clip->setVisible(rect->visible());
   item.clip->setPosition(rect->x(), rect->y());
   item.clip->setFrameSize(rect->width(), rect->height());
-  item.label->setText(m_label->text());
+  item.label->setUseMarkup(displayProjected());
+  item.label->setText(displayProjected() ? m_displayProjection.contrastMarkup : m_label->text());
   item.label->setFontSize(m_fontSize);
   if (item.label->font().family != m_label->font().family)
     item.label->setFontFamily(m_label->font().family);
@@ -573,20 +626,24 @@ void Input::updateClippedText(Renderer& renderer, RectNode* rect, SelectionText&
     item.label->setFontFeatures(m_label->font().features);
   item.label->setFontWeight(m_label->font().weight);
   item.label->setTextAlign(m_label->textAlign());
-  item.label->setMaxLines(m_multiline ? 0 : 1);
+  item.label->setMaxLines(m_multiline || displayProjected() ? 0 : 1);
   item.label->setMaxWidth(m_label->maxWidth());
   item.label->setColor(color);
   item.label->measure(renderer);
-  item.label->setPosition(m_label->x() - rect->x(), m_label->y() - rect->y());
+  item.label->setPosition(m_label->x() + m_label->textOriginX() - item.label->textOriginX() - rect->x(),
+                          m_label->y() + m_label->baselineOffset() - item.label->baselineOffset() - rect->y());
 }
 
 void Input::updateTextOverlays(Renderer& renderer) {
   std::size_t used = 0;
   auto overlay = [&](RectNode* rect) {
-    if (!m_selectionForeground || !hasSelection() || passwordMasked() || !rect->visible() ||
+    rect->setZIndex(displayProjected() ? 1 : 0);
+    if ((!m_selectionForeground && !displayProjected()) || !hasSelection() || passwordMasked() || !rect->visible() ||
         rect->y() + rect->height() <= 0 || rect->y() >= m_textViewport->height()) return;
     if (used == m_selectionText.size()) m_selectionText.push_back({});
-    updateClippedText(renderer, rect, m_selectionText[used++], *m_selectionForeground);
+    updateClippedText(renderer, rect, m_selectionText[used++],
+                      m_selectionForeground.value_or(readableTextColorForBackground(rect->style().fill)));
+    m_selectionText[used - 1].clip->setZIndex(displayProjected() ? 2 : 0);
   };
   overlay(m_selectionRect);
   for (auto* rect : m_selectionLineRects) overlay(rect);
@@ -611,14 +668,70 @@ bool Input::insertionAllowed(std::string_view text, bool preedit) const {
   return m_editValidator(before, after, preedit);
 }
 
+bool Input::rewriteEdit(const EditSnapshot& before, EditSnapshot& after, bool preedit) const {
+  if (m_editRewriter) m_editRewriter(before, after, preedit);
+  if (m_editValidator && !m_editValidator(before.value, after.value, preedit)) return false;
+  after.cursorPos = clampToUtf8End(after.value, after.cursorPos);
+  after.selectionAnchor = clampToUtf8End(after.value, after.selectionAnchor);
+  return true;
+}
+
+void Input::trackPreeditRange(const EditSnapshot& before, std::size_t replacedStart, std::size_t replacedEnd) {
+  // Rewriting may extend the edit, but equal text must not shrink or relocate its native range.
+  std::size_t start = 0;
+  while (start < replacedStart && start < m_value.size() &&
+         before.value[start] == m_value[start]) ++start;
+  start = clampToUtf8Start(m_value, start);
+  std::size_t oldEnd = before.value.size(), end = m_value.size();
+  while (oldEnd > replacedEnd && end > start && before.value[oldEnd - 1] == m_value[end - 1]) {
+    --oldEnd;
+    --end;
+  }
+  m_preeditStart = start;
+  m_preeditLen = clampToUtf8End(m_value, end) - start;
+}
+
+bool Input::replaceTextRange(std::size_t start, std::size_t end, std::string_view text,
+                             EditCoalesceKind kind, bool preedit) {
+  if (m_editRewriter || m_preeditBase) {
+    auto before = currentEditSnapshot();
+    auto after = before;
+    after.value.replace(start, end - start, text);
+    after.cursorPos = after.selectionAnchor = start + text.size();
+    if (!rewriteEdit(before, after, preedit)) return false;
+    removePreeditText();
+    if (!preedit) pushUndoSnapshot(kind);
+    m_value = std::move(after.value);
+    m_cursorPos = after.cursorPos;
+    m_selectionAnchor = after.selectionAnchor;
+    if (preedit) {
+      m_preeditBase = std::move(before);
+      trackPreeditRange(*m_preeditBase, start, end);
+    }
+    return true;
+  }
+  if (m_editValidator && !text.empty()) {
+    auto after = m_value;
+    after.replace(start, end - start, text);
+    if (!m_editValidator(m_value, after, preedit)) return false;
+  }
+  if (preedit) m_preeditBase = currentEditSnapshot();
+  else pushUndoSnapshot(kind);
+  m_value.replace(start, end - start, text);
+  m_cursorPos = m_selectionAnchor = start + text.size();
+  if (preedit) {
+    m_preeditStart = start;
+    m_preeditLen = text.size();
+  }
+  return true;
+}
+
 bool Input::insertText(std::string_view text) {
-  if (!insertionAllowed(text)) return false;
-  removePreeditText();
-  pushUndoSnapshot(EditCoalesceKind::Discrete);
-  deleteSelection();
-  m_value.insert(m_cursorPos, text);
-  m_cursorPos += text.size();
-  m_selectionAnchor = m_cursorPos;
+  if (text.empty() && !m_editRewriter && !m_preeditBase && !insertionAllowed(text)) return false;
+  const auto cursor = m_preeditBase ? m_preeditBase->cursorPos : m_cursorPos;
+  const auto anchor = m_preeditBase ? m_preeditBase->selectionAnchor : m_selectionAnchor;
+  if (!replaceTextRange(std::min(cursor, anchor), std::max(cursor, anchor), text,
+                        EditCoalesceKind::Discrete)) return false;
   updateDisplayText();
   markTextContentChanged();
   revealCursor();
@@ -645,6 +758,7 @@ void Input::setFontSize(float size) {
   }
   resetCaretEffects();
   m_fontSize = next;
+  m_logicalStrutDirty = true;
   if (m_label != nullptr) {
     m_label->setFontSize(m_fontSize);
   }
@@ -772,6 +886,7 @@ void Input::setFontWeight(FontWeight fontWeight) {
   if (m_label != nullptr) {
     if (m_label->font().weight != fontWeight) resetCaretEffects();
     m_label->setFontWeight(fontWeight);
+    m_logicalStrutDirty = true;
   }
   markTextContentChanged();
 }
@@ -884,7 +999,7 @@ void Input::moveCaretLeft(bool shift) {
     m_cursorPos = selectionStart();
     m_selectionAnchor = m_cursorPos;
   } else {
-    m_cursorPos = prevCharPos(m_value, m_cursorPos);
+    m_cursorPos = adjacentVisibleByte(m_cursorPos, true);
     if (!shift) {
       m_selectionAnchor = m_cursorPos;
     }
@@ -900,7 +1015,7 @@ void Input::moveCaretRight(bool shift) {
     m_cursorPos = selectionEnd();
     m_selectionAnchor = m_cursorPos;
   } else {
-    m_cursorPos = nextCharPos(m_value, m_cursorPos);
+    m_cursorPos = adjacentVisibleByte(m_cursorPos, false);
     if (!shift) {
       m_selectionAnchor = m_cursorPos;
     }
@@ -972,36 +1087,46 @@ void Input::textInputApplyEdit(const TextInputEdit& edit) {
     permanent.value.replace(start, end - start, edit.commitText);
     permanent.cursorPos = permanent.selectionAnchor = start + edit.commitText.size();
   }
+  if (permanent.value != before.value && !rewriteEdit(before, permanent, false)) return;
   const bool changed = permanent.value != before.value;
-  if (changed && m_editValidator && !m_editValidator(before.value, permanent.value, false)) return;
   auto display = permanent;
   bool showPreedit = edit.hasPreedit && !edit.preeditText.empty();
   if (showPreedit) {
     start = std::min(display.cursorPos, display.selectionAnchor);
     end = std::max(display.cursorPos, display.selectionAnchor);
     display.value.replace(start, end - start, edit.preeditText);
-    if (m_editValidator && !m_editValidator(permanent.value, display.value, true)) {
+    const auto cursor = edit.preeditCursorBegin < 0 ? edit.preeditText.size() :
+        std::min(edit.preeditText.size(), static_cast<std::size_t>(edit.preeditCursorBegin));
+    const auto anchor = edit.preeditCursorEnd < 0 ? cursor :
+        std::min(edit.preeditText.size(), static_cast<std::size_t>(edit.preeditCursorEnd));
+    display.cursorPos = start + clampToUtf8End(edit.preeditText, cursor);
+    display.selectionAnchor = start + clampToUtf8End(edit.preeditText, anchor);
+    if (!rewriteEdit(permanent, display, true)) {
       showPreedit = false;
       display = permanent;
-    } else {
-      const auto cursor = edit.preeditCursorBegin < 0 ? edit.preeditText.size() :
-          std::min(edit.preeditText.size(), static_cast<std::size_t>(edit.preeditCursorBegin));
-      const auto anchor = edit.preeditCursorEnd < 0 ? cursor :
-          std::min(edit.preeditText.size(), static_cast<std::size_t>(edit.preeditCursorEnd));
-      display.cursorPos = start + clampToUtf8End(edit.preeditText, cursor);
-      display.selectionAnchor = start + clampToUtf8End(edit.preeditText, anchor);
     }
   }
+  const bool caretChanged = m_cursorPos != display.cursorPos ||
+      m_selectionAnchor != display.selectionAnchor ||
+      m_preeditCaretHidden != (showPreedit && edit.preeditCursorBegin < 0);
   if (changed) pushUndoSnapshot(EditCoalesceKind::Discrete);
   m_preeditBase = showPreedit ? std::optional<EditSnapshot>(permanent) : std::nullopt;
   m_preeditCaretHidden = showPreedit && edit.preeditCursorBegin < 0;
   m_preeditStart = showPreedit ? start : 0;
   m_preeditLen = showPreedit ? edit.preeditText.size() : 0;
+  const bool displayChanged = m_value != display.value;
   m_value = std::move(display.value);
   m_cursorPos = display.cursorPos;
   m_selectionAnchor = display.selectionAnchor;
-  updateDisplayText();
-  markTextContentChanged();
+  if (showPreedit && m_editRewriter) trackPreeditRange(permanent, start, end);
+  if (displayChanged) {
+    updateDisplayText();
+    markTextContentChanged();
+  } else if (caretChanged) {
+    m_revealCursorYPending = true;
+    if (m_multiline) ensureCursorVisibleY();
+    markLayoutDirty();
+  }
   updateInteractiveGeometry();
   revealCursor();
   markPaintDirty();
@@ -1042,7 +1167,6 @@ void Input::markTextContentChanged() {
 
 void Input::rebuildCursorStopsFull(Renderer& renderer) {
   const bool showPasswordGlyphs = passwordMasked() && !m_value.empty();
-
   m_stopByte.clear();
   m_stopX.clear();
   m_stopRect.clear();
@@ -1053,16 +1177,7 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
   m_stopsInLogicalOrder = true;
   m_stopsBuiltForWidth = textViewportWidth();
   m_multilineLabelX = 0.0F;
-
-  if (m_value.empty()) {
-    if (m_caretShape != CaretShape::Line && !showPasswordGlyphs) {
-      renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
-    }
-    if (m_multiline) {
-      m_stopRect.push_back(TextCursorStop{0.0F, 0.0F, renderer.fontRowExtent(m_fontSize, m_label->font())});
-    }
-    return;
-  }
+  m_contentTextHeight = 0.0F;
 
   const float passwordCellSize = showPasswordGlyphs ? std::round(m_fontSize * kPasswordGlyphScale) : 0.0F;
   std::size_t pos = 0;
@@ -1075,6 +1190,51 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
       m_stopX.push_back(maskX);
     }
   }
+
+  if (displayProjected()) {
+    m_displayStopByte.clear();
+    m_displayStopByte.push_back(0);
+    for (std::size_t byte = 0; byte < m_displayProjection.text.size();) {
+      byte = nextCharPos(m_displayProjection.text, byte);
+      m_displayStopByte.push_back(byte);
+    }
+    const float wrapWidth = m_multiline ? m_stopsBuiltForWidth : 0.0F;
+    renderer.measureTextCaretStops(m_displayProjection.markup, m_fontSize, m_displayStopByte,
+                                   wrapWidth, m_displayCells, m_label->font(), true);
+    if (m_displayCells.size() != m_displayStopByte.size())
+      m_displayCells.assign(m_displayStopByte.size(),
+                           TextCursorStop{.height = m_logicalStrut, .lineHeight = m_logicalStrut});
+    if (m_displayProjection.text.empty()) m_displayCells.front().height = m_logicalStrut;
+    auto& stops = m_multiline ? m_stopRect : m_caretCells;
+    stops.reserve(m_stopByte.size());
+    m_stopX.resize(m_stopByte.size());
+    std::size_t displayIndex = 0;
+    for (std::size_t i = 0; i < m_stopByte.size(); ++i) {
+      while (displayIndex + 1 < m_displayStopByte.size() &&
+             m_displayStopByte[displayIndex] < displayByte(m_stopByte[i])) ++displayIndex;
+      stops.push_back(m_displayCells[displayIndex]);
+      m_stopX[i] = stops.back().x;
+    }
+    const auto metrics = renderer.measureText(m_displayProjection.markup, m_fontSize, m_label->font(),
+        wrapWidth, 0, TextAlign::Start, TextEllipsize::End, true);
+    m_projectedLayoutBaseline = metrics.layoutBaseline;
+    m_contentTextHeight = metrics.layoutHeight;
+    m_multilineLabelX = metrics.alignOffsetX;
+    if (!m_multiline) m_stopsInLogicalOrder = std::ranges::is_sorted(m_stopX);
+    return;
+  }
+
+  if (m_value.empty()) {
+    if (m_caretShape != CaretShape::Line && !showPasswordGlyphs) {
+      renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
+      for (auto& stop : m_caretCells) stop.height = m_logicalStrut;
+    }
+    if (m_multiline)
+      m_stopRect.push_back(TextCursorStop{.height = m_logicalStrut, .lineHeight = m_logicalStrut});
+    m_contentTextHeight = m_logicalStrut;
+    return;
+  }
+
   if (m_multiline) {
     if (m_caretShape == CaretShape::Line) {
       renderer.measureTextCursorStopsWrapped(
@@ -1086,15 +1246,14 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
       );
     }
     if (m_stopRect.size() != m_stopByte.size()) {
-      m_stopRect.assign(m_stopByte.size(), TextCursorStop{0.0F, 0.0F, m_fontSize});
+      m_stopRect.assign(m_stopByte.size(),
+                        TextCursorStop{.height = m_logicalStrut, .lineHeight = m_logicalStrut});
     }
     m_stopX.resize(m_stopRect.size());
-    for (std::size_t i = 0; i < m_stopRect.size(); ++i) {
-      m_stopX[i] = m_stopRect[i].x;
-    }
-    // The stops are in layout coordinates, but the label draws from its leftmost line: when every line is
-    // right-aligned (RTL paragraphs in an LTR UI) that line starts inside the viewport.
-    m_multilineLabelX = renderer.measureText(m_value, m_fontSize, m_label->font(), m_stopsBuiltForWidth).alignOffsetX;
+    for (std::size_t i = 0; i < m_stopRect.size(); ++i) m_stopX[i] = m_stopRect[i].x;
+    const auto metrics = renderer.measureText(m_value, m_fontSize, m_label->font(), m_stopsBuiltForWidth);
+    m_multilineLabelX = metrics.alignOffsetX;
+    m_contentTextHeight = metrics.layoutHeight;
   } else if (!showPasswordGlyphs) {
     if (m_caretShape == CaretShape::Line) {
       renderer.measureTextCursorStops(m_value, m_fontSize, m_stopByte, m_stopX, m_label->font());
@@ -1104,20 +1263,27 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
       m_stopX.reserve(m_caretCells.size());
       for (const auto& stop : m_caretCells) m_stopX.push_back(stop.x);
     }
-    if (m_stopX.size() != m_stopByte.size()) {
-      m_stopX.assign(m_stopByte.size(), 0.0F);
-    }
+    if (m_stopX.size() != m_stopByte.size()) m_stopX.assign(m_stopByte.size(), 0.0F);
     m_stopsInLogicalOrder = std::ranges::is_sorted(m_stopX);
-    if (!m_stopsInLogicalOrder) {
+    if (!m_stopsInLogicalOrder)
       renderer.measureTextCharSpans(m_value, m_fontSize, m_stopByte, m_charSpans, m_label->font());
-    }
   }
 }
 
 void Input::rebuildCursorStops(Renderer& renderer) {
-  if (!m_textMetricsDirty) {
-    return;
+  m_renderer = &renderer;
+  const auto generation = renderer.textMetricsGeneration();
+  const float scale = renderer.renderScale();
+  if (m_metricsGeneration != generation || m_metricsRenderScale != scale) {
+    m_metricsGeneration = generation;
+    m_metricsRenderScale = scale;
+    m_textMetricsDirty = m_logicalStrutDirty = true;
   }
+  if (m_logicalStrutDirty) {
+    m_logicalStrut = std::max(1.0F, renderer.measureText(" ", m_fontSize, m_label->font()).layoutHeight);
+    m_logicalStrutDirty = false;
+  }
+  if (!m_textMetricsDirty) return;
   rebuildCursorStopsFull(renderer);
   m_textMetricsDirty = false;
 }
@@ -1179,7 +1345,7 @@ std::size_t Input::visibleLabelEndByte(float contentWidth, std::size_t startByte
 }
 
 void Input::updateLabelVisibleSlice(Renderer& renderer) {
-  if (m_label == nullptr || m_value.empty() || passwordMasked()) {
+  if (m_label == nullptr || m_value.empty() || passwordMasked() || displayProjected()) {
     return;
   }
 
@@ -1214,6 +1380,12 @@ void Input::updateLabelVisibleSlice(Renderer& renderer) {
 
 void Input::syncLabelScrollPosition() {
   if (m_label == nullptr || (passwordMasked() && !m_value.empty())) {
+    return;
+  }
+  if (displayProjected() && !m_value.empty()) {
+    m_label->setPosition(m_multilineLabelX - m_label->textOriginX() -
+                            (m_multiline ? 0.0F : m_scrollOffset - m_contentLeadSlack),
+                        m_cachedLabelY - (m_multiline ? m_scrollOffsetY : 0.0F));
     return;
   }
   if (m_multiline) {
@@ -1273,9 +1445,18 @@ void Input::doLayout(Renderer& renderer) {
     if (m_value.empty() && !m_placeholder.empty()) {
       m_label->measure(renderer);
       m_cachedLabelY = std::round((h - m_label->height()) * 0.5F);
+    } else if (displayProjected()) {
+      m_label->measure(renderer);
+      m_cachedLabelY = std::round((h - m_label->height()) * 0.5F);
     } else if (!m_value.empty()) {
       updateLabelVisibleSlice(renderer);
     }
+  }
+  if (displayProjected()) {
+    m_projectedOriginY = m_displayProjection.text.empty()
+        ? (m_multiline ? kMultilinePadV : std::round((h - m_logicalStrut) * 0.5F))
+        : m_cachedLabelY + m_label->baselineOffset() -
+            std::floor(m_projectedLayoutBaseline * m_cursorRenderScale) / m_cursorRenderScale;
   }
 
   std::size_t charCount = 0;
@@ -1336,6 +1517,13 @@ void Input::doLayout(Renderer& renderer) {
   applyVisualState();
   updateCursorVisibility();
   updateTextOverlays(renderer);
+}
+
+bool Input::usesTextGeometry(std::uint32_t sym) noexcept {
+  return KeySymbol::isLeft(sym) || KeySymbol::isRight(sym) ||
+         KeySymbol::isHome(sym) || KeySymbol::isEnd(sym) ||
+         KeySymbol::isUp(sym) || KeySymbol::isDown(sym) ||
+         KeySymbol::isPageUp(sym) || KeySymbol::isPageDown(sym);
 }
 
 void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers, bool preedit) {
@@ -1415,15 +1603,60 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     }
   }
   // Validate insertion before removing an existing composition or recording undo.
-  if ((plainPrintableText || preedit) && utf32 >= 0x20U && utf32 != 0x7FU &&
-      !insertionAllowed(StringUtils::utf32ToUtf8(utf32), preedit)) return;
-  if (m_multiline && KeySymbol::isEnter(sym) && !ctrl &&
-      (!m_submitOnEnter || shift) && !insertionAllowed("\n")) return;
+  if (!m_editRewriter && m_preeditBase) {
+    if ((plainPrintableText || preedit) && utf32 >= 0x20U && utf32 != 0x7FU &&
+        !insertionAllowed(StringUtils::utf32ToUtf8(utf32), preedit)) return;
+    if (m_multiline && KeySymbol::isEnter(sym) && !ctrl &&
+        (!m_submitOnEnter || shift) && !insertionAllowed("\n")) return;
+  }
 
   bool changed = false;
+  bool displayTextCurrent = false;
+  auto previousPreedit = m_editValidator && m_preeditBase
+      ? std::optional<EditingState>(editingState()) : std::nullopt;
+  bool rejected = false;
+  auto replace = [&](std::size_t start, std::size_t end, std::string_view text,
+                     EditCoalesceKind kind, bool isPreedit = false) {
+    const bool accepted = replaceTextRange(start, end, text, kind, isPreedit);
+    rejected = !accepted;
+    if (accepted) displayTextCurrent = false;
+    return accepted;
+  };
+  auto eraseVisible = [&](bool backward, bool word) {
+    std::size_t start = m_cursorPos, end = m_cursorPos;
+    if (!displayProjected()) {
+      if (backward) start = word ? previousWordStartForByteOffset(start) : prevCharPos(m_value, start);
+      else end = word ? nextWordEndForByteOffset(end) : nextCharPos(m_value, end);
+    } else if (m_displayProjection.text.empty()) {
+      if (backward) start = 0;
+      else end = m_value.size();
+    } else if (backward) {
+      end = rawByteForDisplay(displayByte(m_cursorPos), false);
+      start = word ? previousWordStartForByteOffset(m_cursorPos) : adjacentVisibleByte(end, true);
+    } else {
+      start = rawByteForDisplay(displayByte(m_cursorPos), true);
+      end = word ? nextWordEndForByteOffset(m_cursorPos) : nextCharPos(m_value, start);
+    }
+    if (start >= end) return false;
+    return replace(start, end, {}, EditCoalesceKind::Discrete);
+  };
 
   // Remove previous preedit text before processing
   changed = removePreeditText();
+  if (changed) {
+    updateDisplayText();
+    markTextContentChanged();
+    if (usesTextGeometry(sym) && m_renderer != nullptr) doLayout(*m_renderer);
+    displayTextCurrent = true;
+    if (usesTextGeometry(sym) && m_renderer == nullptr) {
+      // No native layout has been bound: publish the restored base, not a guessed visual move.
+      revealCursor();
+      notifyTextInputStateChanged(TextInputChangeCause::Other);
+      if (alive.expired()) return;
+      if (!preedit && m_onChange) m_onChange(m_value);
+      return;
+    }
+  }
 
   const bool copyShortcut = ctrl && (KeySymbol::isInsert(sym) || sym == 'c' || sym == 'C');
   const bool cutShortcut =
@@ -1435,8 +1668,10 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       return;
     }
     if (changed) {
-      updateDisplayText();
-      markTextContentChanged();
+      if (!displayTextCurrent) {
+        updateDisplayText();
+        markTextContentChanged();
+      }
       revealCursor();
       notifyTextInputStateChanged(TextInputChangeCause::Other);
       if (!preedit && m_onChange) {
@@ -1450,8 +1685,10 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       return;
     }
     if (changed) {
-      updateDisplayText();
-      markTextContentChanged();
+      if (!displayTextCurrent) {
+        updateDisplayText();
+        markTextContentChanged();
+      }
       revealCursor();
       notifyTextInputStateChanged(TextInputChangeCause::Other);
       if (!preedit && m_onChange) {
@@ -1464,19 +1701,11 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     resetUndoCoalescing();
     if (g_readlineShortcuts) {
       if (m_cursorPos > 0) {
-        pushUndoSnapshot(EditCoalesceKind::Discrete);
-        m_value.erase(0, m_cursorPos);
-        m_cursorPos = 0;
-        m_selectionAnchor = 0;
-        changed = true;
+        changed = replace(0, m_cursorPos, {}, EditCoalesceKind::Discrete) || changed;
       }
     } else {
       if (!m_value.empty() || hasSelection()) {
-        pushUndoSnapshot(EditCoalesceKind::Discrete);
-        m_value.clear();
-        m_cursorPos = 0;
-        m_selectionAnchor = 0;
-        changed = true;
+        changed = replace(0, m_value.size(), {}, EditCoalesceKind::Discrete) || changed;
       }
     }
   } else if (ctrl && (sym == 'a' || sym == 'A')) {
@@ -1497,7 +1726,7 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     if (hasSelection()) {
       m_cursorPos = selectionStart();
     } else {
-      m_cursorPos = prevCharPos(m_value, m_cursorPos);
+      m_cursorPos = adjacentVisibleByte(m_cursorPos, true);
     }
     m_selectionAnchor = m_cursorPos;
   } else if (lineEditCaretForward) {
@@ -1505,7 +1734,7 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     if (hasSelection()) {
       m_cursorPos = selectionEnd();
     } else {
-      m_cursorPos = nextCharPos(m_value, m_cursorPos);
+      m_cursorPos = adjacentVisibleByte(m_cursorPos, false);
     }
     m_selectionAnchor = m_cursorPos;
   } else if (lineEditWordBack) {
@@ -1518,46 +1747,26 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     m_selectionAnchor = m_cursorPos;
   } else if (lineEditDeleteWordBack) {
     if (hasSelection()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      deleteSelection();
-      changed = true;
+      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
     } else {
-      const std::size_t prev = previousWordStartForByteOffset(m_cursorPos);
-      if (prev != m_cursorPos) {
-        pushUndoSnapshot(EditCoalesceKind::Discrete);
-        m_value.erase(prev, m_cursorPos - prev);
-        m_cursorPos = prev;
-        m_selectionAnchor = prev;
-        changed = true;
-      }
+      changed = eraseVisible(true, true) || changed;
     }
   } else if (lineEditDeleteToEnd) {
     if (m_cursorPos < m_value.size()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      m_value.erase(m_cursorPos);
-      m_selectionAnchor = m_cursorPos;
-      changed = true;
+      changed = replace(m_cursorPos, m_value.size(), {}, EditCoalesceKind::Discrete) || changed;
     }
   } else if (lineEditDeleteWordForward) {
-    const std::size_t end = nextWordEndForByteOffset(m_cursorPos);
-    if (end != m_cursorPos) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      m_value.erase(m_cursorPos, end - m_cursorPos);
-      m_selectionAnchor = m_cursorPos;
-      changed = true;
-    }
+    changed = eraseVisible(false, true) || changed;
   } else if (copyShortcut) {
     if (g_clipboard != nullptr && hasSelection() && !m_passwordMode) {
       g_clipboard->setClipboardText(m_value.substr(selectionStart(), selectionEnd() - selectionStart()));
     }
   } else if (cutShortcut) {
     if (g_clipboard != nullptr && hasSelection()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
       if (!m_passwordMode) {
         g_clipboard->setClipboardText(m_value.substr(selectionStart(), selectionEnd() - selectionStart()));
       }
-      deleteSelection();
-      changed = true;
+      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
     }
   } else if (pasteShortcut) {
     if (g_clipboard != nullptr) {
@@ -1569,27 +1778,15 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     }
   } else if (KeySymbol::isBackspace(sym)) {
     if (hasSelection()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      deleteSelection();
-      changed = true;
+      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
     } else if (m_cursorPos > 0) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      const std::size_t prev = ctrl ? previousWordStartForByteOffset(m_cursorPos) : prevCharPos(m_value, m_cursorPos);
-      m_value.erase(prev, m_cursorPos - prev);
-      m_cursorPos = prev;
-      m_selectionAnchor = prev;
-      changed = true;
+      changed = eraseVisible(true, ctrl) || changed;
     }
   } else if (KeySymbol::isDelete(sym)) {
     if (hasSelection()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      deleteSelection();
-      changed = true;
+      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
     } else if (m_cursorPos < m_value.size()) {
-      pushUndoSnapshot(EditCoalesceKind::Discrete);
-      const std::size_t next = ctrl ? nextWordEndForByteOffset(m_cursorPos) : nextCharPos(m_value, m_cursorPos);
-      m_value.erase(m_cursorPos, next - m_cursorPos);
-      changed = true;
+      changed = eraseVisible(false, ctrl) || changed;
     }
   } else if (KeySymbol::isLeft(sym) || KeySymbol::isRight(sym)) {
     resetUndoCoalescing();
@@ -1607,7 +1804,7 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       } else if (ctrl) {
         m_cursorPos = left ? previousWordStartForByteOffset(m_cursorPos) : nextWordStartForByteOffset(m_cursorPos);
       } else {
-        m_cursorPos = left ? prevCharPos(m_value, m_cursorPos) : nextCharPos(m_value, m_cursorPos);
+        m_cursorPos = adjacentVisibleByte(m_cursorPos, left);
       }
       if (!shift) {
         m_selectionAnchor = m_cursorPos;
@@ -1640,16 +1837,9 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
         }
       }
     } else {
-      if (!insertionAllowed("\n")) return;
-      pushUndoSnapshot(hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing);
-      if (hasSelection()) {
-        deleteSelection();
-      }
-      m_value.insert(m_cursorPos, 1, '\n');
-      ++m_cursorPos;
-      m_selectionAnchor = m_cursorPos;
-      changed = true;
-      noteTypingEditEnd();
+      changed = replace(selectionStart(), selectionEnd(), "\n",
+                        hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing) || changed;
+      if (!rejected) noteTypingEditEnd();
     }
   } else if (KeySymbol::isHome(sym)) {
     resetUndoCoalescing();
@@ -1673,30 +1863,35 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
   } else if (utf32 >= 0x20U && utf32 != 0x7FU) {
     // Printable character (skip DEL = 0x7F)
     const auto bytes = StringUtils::utf32ToUtf8(utf32);
-    if (!insertionAllowed(bytes, preedit)) return;
-    if (preedit) m_preeditBase = currentEditSnapshot();
-    if (!preedit) {
-      pushUndoSnapshot(hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing);
-    }
-    if (hasSelection()) {
-      deleteSelection();
-    }
-    m_value.insert(m_cursorPos, bytes);
-    if (preedit) {
-      m_preeditStart = m_cursorPos;
-      m_preeditLen = bytes.size();
-    }
-    m_cursorPos += bytes.size();
-    m_selectionAnchor = m_cursorPos;
-    changed = true;
-    if (!preedit) {
+    changed = replace(selectionStart(), selectionEnd(), bytes,
+                      hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing, preedit) || changed;
+    if (!preedit && !rejected) {
       noteTypingEditEnd();
     }
   }
+  if (rejected) {
+    if (previousPreedit) {
+      m_value = std::move(previousPreedit->current.value);
+      m_cursorPos = previousPreedit->current.cursorPos;
+      m_selectionAnchor = previousPreedit->current.selectionAnchor;
+      m_preeditBase = std::move(previousPreedit->preeditBase);
+      m_preeditStart = previousPreedit->preeditStart;
+      m_preeditLen = previousPreedit->preeditLength;
+      m_preeditCaretHidden = previousPreedit->preeditCaretHidden;
+      if (displayTextCurrent) {
+        updateDisplayText();
+        markTextContentChanged();
+        if (m_renderer != nullptr) doLayout(*m_renderer);
+      }
+    }
+    return;
+  }
 
-  updateDisplayText();
   if (changed) {
-    markTextContentChanged();
+    if (!displayTextCurrent) {
+      updateDisplayText();
+      markTextContentChanged();
+    }
     revealCursor();
     notifyTextInputStateChanged(TextInputChangeCause::Other);
     if (!preedit && m_onChange) {
@@ -1710,7 +1905,8 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
 }
 
 void Input::notifyTextInputStateChanged(TextInputChangeCause cause) {
-  if (m_selectionForeground) markLayoutDirty();
+  clampEditState();
+  if (m_selectionForeground || displayProjected()) markLayoutDirty();
   const std::weak_ptr<int> alive = m_aliveToken;
   if (m_onEditingStateChanged) m_onEditingStateChanged();
   if (alive.expired()) return;
@@ -1864,15 +2060,19 @@ void Input::applyVisualState() {
 }
 
 void Input::updateDisplayText() {
+  m_labelVisibleSlice.clear();
+  m_labelVisibleStartByte = 0;
+  m_labelSliceOriginX = 0.0F;
+  if (displayProjected()) m_displayProjection = m_displayProjector(m_value);
+  m_label->setUseMarkup(displayProjected());
+  m_label->setMaxLines(m_multiline || displayProjected() ? 0 : 1);
   if (m_value.empty() && !m_placeholder.empty()) {
-    m_labelVisibleSlice.clear();
+    m_label->setUseMarkup(false);
     m_label->setText(m_placeholder);
   } else if (passwordMasked()) {
-    m_labelVisibleSlice.clear();
     m_label->setText(std::string{});
   } else {
-    m_labelVisibleSlice.clear();
-    m_label->setText(m_value);
+    m_label->setText(displayProjected() ? m_displayProjection.markup : m_value);
   }
 }
 
@@ -1893,10 +2093,8 @@ void Input::clearFromButton() {
   if (m_value.empty()) {
     return;
   }
-  pushUndoSnapshot(EditCoalesceKind::Discrete);
-  m_value.clear();
-  m_cursorPos = 0;
-  m_selectionAnchor = 0;
+  const auto size = m_preeditBase ? m_preeditBase->value.size() : m_value.size();
+  if (!replaceTextRange(0, size, {}, EditCoalesceKind::Discrete)) return;
   m_preeditStart = 0;
   m_preeditLen = 0;
   m_scrollOffset = 0.0F;
@@ -1976,7 +2174,9 @@ void Input::updateCaretPaint(float cellX, float cellWidth) {
   if (m_caretText.clip != nullptr) {
     m_caretText.clip->setPosition(rect.x, rect.y);
     m_caretText.clip->setFrameSize(rect.width, rect.height);
-    m_caretText.label->setPosition(m_label->x() - rect.x, m_label->y() - rect.y);
+    m_caretText.label->setPosition(
+        m_label->x() + m_label->textOriginX() - m_caretText.label->textOriginX() - rect.x,
+        m_label->y() + m_label->baselineOffset() - m_caretText.label->baselineOffset() - rect.y);
   }
   auto* animations = animationManager();
   const bool allowed = m_caretEffect != CaretEffect::Off && animations != nullptr &&
@@ -2113,10 +2313,12 @@ void Input::updateInteractiveGeometry() {
     if (multilineStopsValid()) {
       stop = m_stopRect[stopIndexForByte(m_cursorPos)];
     }
-    placeCursor(stop.x, stop.y + kMultilinePadV - m_scrollOffsetY, std::max(1.0F, stop.height));
+    placeCursor(stop.x, stop.y + (displayProjected() ? m_projectedOriginY : kMultilinePadV) -
+                    m_scrollOffsetY, std::max(1.0F, stop.height));
 
     m_selectionRect->setVisible(false);
-    updateMultilineSelection();
+    if (displayProjected()) updateProjectedSelection();
+    else updateMultilineSelection();
     return;
   }
 
@@ -2144,6 +2346,14 @@ void Input::updateInteractiveGeometry() {
         markPaintDirty();
       }
     }
+  }
+  if (displayProjected() && m_caretCells.size() == m_stopByte.size() && !m_caretCells.empty()) {
+    const auto& stop = m_caretCells[stopIndexForByte(m_cursorPos)];
+    placeCursor(stop.x - m_scrollOffset + m_contentLeadSlack,
+                stop.y + m_projectedOriginY, std::max(1.0F, stop.height));
+    m_selectionRect->setVisible(false);
+    updateProjectedSelection();
+    return;
   }
 
   const float controlHeight = height() > 0.0F ? height() : m_controlHeight;
@@ -2231,7 +2441,7 @@ void Input::clampScrollOffset() {
 }
 
 bool Input::multilineStopsValid() const noexcept {
-  return !m_stopRect.empty() && m_stopRect.size() == m_stopByte.size();
+  return !m_textMetricsDirty && !m_stopRect.empty() && m_stopRect.size() == m_stopByte.size();
 }
 
 std::size_t Input::stopIndexForByte(std::size_t bytePos) const {
@@ -2246,10 +2456,7 @@ std::size_t Input::stopIndexForByte(std::size_t bytePos) const {
 }
 
 float Input::contentTextHeight() const noexcept {
-  if (m_stopRect.empty()) {
-    return 0.0F;
-  }
-  return m_stopRect.back().y + m_stopRect.back().height;
+  return m_contentTextHeight;
 }
 
 float Input::textViewportHeight() const noexcept {
@@ -2259,13 +2466,13 @@ float Input::textViewportHeight() const noexcept {
 
 float Input::currentLineHeight() const noexcept {
   if (multilineStopsValid()) {
-    return std::max(1.0F, m_stopRect[stopIndexForByte(m_cursorPos)].height);
+    return std::max(1.0F, m_stopRect[stopIndexForByte(m_cursorPos)].lineHeight);
   }
-  return std::max(1.0F, m_fontSize * 1.4F);
+  return std::max(1.0F, m_logicalStrut);
 }
 
 float Input::measuredMultilineHeight() const noexcept {
-  return (m_value.empty() ? currentLineHeight() : contentTextHeight()) + kMultilinePadV * 2.0F;
+  return std::max(m_logicalStrut, contentTextHeight()) + kMultilinePadV * 2.0F;
 }
 
 void Input::ensureCursorVisibleY() {
@@ -2279,10 +2486,10 @@ void Input::ensureCursorVisibleY() {
     return;
   }
   const TextCursorStop& stop = m_stopRect[stopIndexForByte(m_cursorPos)];
-  if (stop.y < m_scrollOffsetY) {
-    m_scrollOffsetY = stop.y;
-  } else if (stop.y + stop.height > m_scrollOffsetY + viewH) {
-    m_scrollOffsetY = stop.y + stop.height - viewH;
+  if (stop.lineY < m_scrollOffsetY) {
+    m_scrollOffsetY = stop.lineY;
+  } else if (stop.lineY + stop.lineHeight > m_scrollOffsetY + viewH) {
+    m_scrollOffsetY = stop.lineY + stop.lineHeight - viewH;
   }
   clampScrollOffsetY();
 }
@@ -2329,9 +2536,7 @@ LayoutSize Input::doMeasure(Renderer& renderer, const LayoutConstraints& constra
     m_textMetricsDirty = true;
     m_revealCursorYPending = true;
   }
-  if (m_textMetricsDirty || m_stopByte.empty()) {
-    rebuildCursorStops(renderer);
-  }
+  rebuildCursorStops(renderer);
   const float w = std::max(width(), minFromHint);
   return constraints.constrain(LayoutSize{.width = w, .height = assignH});
 }
@@ -2448,123 +2653,73 @@ void Input::extendPointerSelectionToByteOffset(std::size_t offset) {
 }
 
 std::size_t Input::wordStartForByteOffset(std::size_t offset) const {
-  if (m_value.empty()) {
-    return 0;
-  }
-
-  if (m_passwordMode) {
-    return 0;
-  }
-
-  std::size_t pos = std::min(offset, m_value.size());
-  if (pos == m_value.size() && pos > 0) {
-    pos = prevCharPos(m_value, pos);
-  }
-
-  if (!isWordCodepoint(m_value, pos)) {
-    return pos;
-  }
-
-  while (pos > 0) {
-    const std::size_t prev = prevCharPos(m_value, pos);
-    if (prev == pos || !isWordCodepoint(m_value, prev)) {
-      break;
+  if (m_passwordMode) return 0;
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  if (text.empty()) return displayProjected() ? std::min(offset, m_value.size()) : 0;
+  std::size_t pos = std::min(displayByte(offset), text.size());
+  if (pos == text.size() && pos > 0) pos = prevCharPos(text, pos);
+  if (isWordCodepoint(text, pos)) {
+    while (pos > 0) {
+      const std::size_t prev = prevCharPos(text, pos);
+      if (prev == pos || !isWordCodepoint(text, prev)) break;
+      pos = prev;
     }
-    pos = prev;
   }
-  return pos;
+  return rawByteForDisplay(pos, true);
 }
 
 std::size_t Input::wordEndForByteOffset(std::size_t offset) const {
-  if (m_value.empty()) {
-    return 0;
+  if (m_passwordMode) return m_value.size();
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  if (text.empty()) return displayProjected() ? std::min(offset, m_value.size()) : 0;
+  std::size_t pos = std::min(displayByte(offset), text.size());
+  if (pos == text.size() && pos > 0) pos = prevCharPos(text, pos);
+  std::size_t end = nextCharPos(text, pos);
+  if (isWordCodepoint(text, pos)) {
+    while (end < text.size() && isWordCodepoint(text, end)) end = nextCharPos(text, end);
   }
-
-  if (m_passwordMode) {
-    return m_value.size();
-  }
-
-  std::size_t pos = std::min(offset, m_value.size());
-  if (pos == m_value.size() && pos > 0) {
-    pos = prevCharPos(m_value, pos);
-  }
-
-  if (!isWordCodepoint(m_value, pos)) {
-    return nextCharPos(m_value, pos);
-  }
-
-  std::size_t end = nextCharPos(m_value, pos);
-  while (end < m_value.size() && isWordCodepoint(m_value, end)) {
-    end = nextCharPos(m_value, end);
-  }
-  return end;
+  return rawByteForDisplay(end, false);
 }
 
 std::size_t Input::previousWordStartForByteOffset(std::size_t offset) const {
-  if (m_value.empty()) {
-    return 0;
-  }
-
-  if (m_passwordMode) {
-    return 0;
-  }
-
-  std::size_t pos = std::min(offset, m_value.size());
+  if (m_passwordMode) return 0;
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  if (text.empty()) return displayProjected() ? std::min(offset, m_value.size()) : 0;
+  std::size_t pos = std::min(displayByte(offset), text.size());
   while (pos > 0) {
-    const std::size_t prev = prevCharPos(m_value, pos);
-    if (prev == pos || isWordCodepoint(m_value, prev)) {
-      break;
-    }
+    const std::size_t prev = prevCharPos(text, pos);
+    if (prev == pos || isWordCodepoint(text, prev)) break;
     pos = prev;
   }
   while (pos > 0) {
-    const std::size_t prev = prevCharPos(m_value, pos);
-    if (prev == pos || !isWordCodepoint(m_value, prev)) {
-      break;
-    }
+    const std::size_t prev = prevCharPos(text, pos);
+    if (prev == pos || !isWordCodepoint(text, prev)) break;
     pos = prev;
   }
-  return pos;
+  return std::min(offset, rawByteForDisplay(pos, true));
 }
 
 std::size_t Input::nextWordStartForByteOffset(std::size_t offset) const {
-  if (m_value.empty()) {
-    return 0;
+  if (m_passwordMode) return m_value.size();
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  if (text.empty()) return displayProjected() ? std::min(offset, m_value.size()) : 0;
+  std::size_t pos = std::min(displayByte(offset), text.size());
+  if (pos < text.size() && isWordCodepoint(text, pos)) {
+    while (pos < text.size() && isWordCodepoint(text, pos)) pos = nextCharPos(text, pos);
   }
-
-  if (m_passwordMode) {
-    return m_value.size();
-  }
-
-  std::size_t pos = std::min(offset, m_value.size());
-  if (pos < m_value.size() && isWordCodepoint(m_value, pos)) {
-    while (pos < m_value.size() && isWordCodepoint(m_value, pos)) {
-      pos = nextCharPos(m_value, pos);
-    }
-  }
-  while (pos < m_value.size() && !isWordCodepoint(m_value, pos)) {
-    pos = nextCharPos(m_value, pos);
-  }
-  return pos;
+  while (pos < text.size() && !isWordCodepoint(text, pos)) pos = nextCharPos(text, pos);
+  // Next starts trail their leading metadata; the terminal edge stays inside the last word's style.
+  return std::max(std::min(offset, m_value.size()), rawByteForDisplay(pos, pos < text.size()));
 }
 
 std::size_t Input::nextWordEndForByteOffset(std::size_t offset) const {
-  if (m_value.empty()) {
-    return 0;
-  }
-
-  if (m_passwordMode) {
-    return m_value.size();
-  }
-
-  std::size_t pos = std::min(offset, m_value.size());
-  while (pos < m_value.size() && !isWordCodepoint(m_value, pos)) {
-    pos = nextCharPos(m_value, pos);
-  }
-  while (pos < m_value.size() && isWordCodepoint(m_value, pos)) {
-    pos = nextCharPos(m_value, pos);
-  }
-  return pos;
+  if (m_passwordMode) return m_value.size();
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  if (text.empty()) return displayProjected() ? std::min(offset, m_value.size()) : 0;
+  std::size_t pos = std::min(displayByte(offset), text.size());
+  while (pos < text.size() && !isWordCodepoint(text, pos)) pos = nextCharPos(text, pos);
+  while (pos < text.size() && isWordCodepoint(text, pos)) pos = nextCharPos(text, pos);
+  return std::max(std::min(offset, m_value.size()), rawByteForDisplay(pos, false));
 }
 
 void Input::syncPasswordGlyphNodes(std::size_t count) {
@@ -2671,16 +2826,6 @@ Input::EditSnapshot Input::currentEditSnapshot() const {
   };
 }
 
-void Input::deleteSelection() {
-  clampEditState();
-
-  const std::size_t start = selectionStart();
-  const std::size_t end = selectionEnd();
-  m_value.erase(start, end - start);
-  m_cursorPos = start;
-  m_selectionAnchor = start;
-}
-
 void Input::clearEditHistory() {
   m_editHistory->undo.clear();
   m_editHistory->redo.clear();
@@ -2785,7 +2930,8 @@ std::size_t Input::xToByteOffset(float localX) const {
   float bestDistance = std::abs(m_stopX.front() - localX);
   for (std::size_t i = 1; i < m_stopX.size(); ++i) {
     const float distance = std::abs(m_stopX[i] - localX);
-    if (distance < bestDistance) {
+    if (distance < bestDistance || (displayProjected() && distance == bestDistance &&
+        displayByte(m_stopByte[i]) == displayByte(m_stopByte[best]))) {
       best = i;
       bestDistance = distance;
     }
@@ -2798,33 +2944,31 @@ std::size_t Input::pointToByteOffset(float localX, float localY) const {
     return 0;
   }
 
+  if (displayProjected()) localY += kMultilinePadV - m_projectedOriginY;
   // Find the visual line containing localY (clamped to first/last line).
   std::size_t lineFirst = 0;
   std::size_t lineLast = 0;
-  bool found = false;
   for (std::size_t i = 0; i < m_stopRect.size();) {
     std::size_t j = i;
-    while (j + 1 < m_stopRect.size() && sameLineY(m_stopRect[j + 1].y, m_stopRect[i].y)) {
+    while (j + 1 < m_stopRect.size() && m_stopRect[j + 1].lineIndex == m_stopRect[i].lineIndex) {
       ++j;
     }
     lineFirst = i;
     lineLast = j;
-    const float top = m_stopRect[i].y;
-    const float bottom = top + m_stopRect[i].height;
+    const float bottom = m_stopRect[i].lineY + m_stopRect[i].lineHeight;
     if (localY < bottom || j + 1 >= m_stopRect.size()) {
-      found = localY >= top || i == 0;
       break;
     }
     i = j + 1;
   }
-  (void)found;
 
   // Nearest caret boundary by x within the line.
   std::size_t best = lineFirst;
   float bestDist = std::numeric_limits<float>::max();
   for (std::size_t i = lineFirst; i <= lineLast; ++i) {
     const float dist = std::abs(m_stopRect[i].x - localX);
-    if (dist < bestDist) {
+    if (dist < bestDist || (displayProjected() && dist == bestDist &&
+        displayByte(m_stopByte[i]) == displayByte(m_stopByte[best]))) {
       bestDist = dist;
       best = i;
     }
@@ -2833,9 +2977,13 @@ std::size_t Input::pointToByteOffset(float localX, float localY) const {
   // Clicking past the end of a soft-wrapped line targets the wrap boundary
   // (one past the line's last char start) rather than before the last char.
   if (best == lineLast && lineLast + 1 < m_stopRect.size() && localX > m_stopRect[lineLast].x) {
-    const std::size_t byte = m_stopByte[lineLast];
-    if (byte < m_value.size() && m_value[byte] != '\n') {
-      return m_stopByte[lineLast + 1];
+    const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+    const std::size_t byte = displayByte(m_stopByte[lineLast]);
+    if (byte < text.size() && text[byte] != '\n') {
+      std::size_t next = lineLast + 1;
+      while (next + 1 < m_stopByte.size() && displayProjected() &&
+             displayByte(m_stopByte[next + 1]) == displayByte(m_stopByte[next])) ++next;
+      return m_stopByte[next];
     }
   }
   return m_stopByte[best];
@@ -2846,7 +2994,7 @@ std::size_t Input::lineStartForByte(std::size_t bytePos) const {
     return 0;
   }
   std::size_t idx = stopIndexForByte(bytePos);
-  while (idx > 0 && sameLineY(m_stopRect[idx - 1].y, m_stopRect[idx].y)) {
+  while (idx > 0 && m_stopRect[idx - 1].lineIndex == m_stopRect[idx].lineIndex) {
     --idx;
   }
   return m_stopByte[idx];
@@ -2857,11 +3005,13 @@ std::size_t Input::lineEndForByte(std::size_t bytePos) const {
     return m_value.size();
   }
   std::size_t idx = stopIndexForByte(bytePos);
-  while (idx + 1 < m_stopRect.size() && sameLineY(m_stopRect[idx + 1].y, m_stopRect[idx].y)) {
+  while (idx + 1 < m_stopRect.size() && m_stopRect[idx + 1].lineIndex == m_stopRect[idx].lineIndex) {
     ++idx;
   }
   const std::size_t byte = m_stopByte[idx];
-  if (byte >= m_value.size() || m_value[byte] == '\n') {
+  const auto& text = displayProjected() ? m_displayProjection.text : m_value;
+  const auto offset = displayByte(byte);
+  if (offset >= text.size() || text[offset] == '\n') {
     // End-of-text stop, or the caret slot just before the newline: already the
     // visual end of this line.
     return byte;
@@ -2880,35 +3030,23 @@ std::size_t Input::byteForVerticalMove(std::size_t from, int lineDelta) {
     m_goalCaretX = m_stopRect[fromIdx].x;
   }
 
-  // Distinct line tops, in stop order, plus the index of the current line.
-  std::vector<float> lineYs;
-  std::size_t currentLine = 0;
-  for (std::size_t i = 0; i < m_stopRect.size(); ++i) {
-    if (lineYs.empty() || !sameLineY(lineYs.back(), m_stopRect[i].y)) {
-      lineYs.push_back(m_stopRect[i].y);
-    }
-    if (i == fromIdx) {
-      currentLine = lineYs.size() - 1;
-    }
-  }
-
-  const std::ptrdiff_t target = static_cast<std::ptrdiff_t>(currentLine) + lineDelta;
+  const int target = m_stopRect[fromIdx].lineIndex + lineDelta;
   if (target < 0) {
     return 0;
   }
-  if (target >= static_cast<std::ptrdiff_t>(lineYs.size())) {
+  if (target > m_stopRect.back().lineIndex) {
     return m_value.size();
   }
 
-  const float targetY = lineYs[static_cast<std::size_t>(target)];
   std::size_t best = fromIdx;
   float bestDist = std::numeric_limits<float>::max();
   for (std::size_t i = 0; i < m_stopRect.size(); ++i) {
-    if (!sameLineY(m_stopRect[i].y, targetY)) {
+    if (m_stopRect[i].lineIndex != target) {
       continue;
     }
     const float dist = std::abs(m_stopRect[i].x - m_goalCaretX);
-    if (dist < bestDist) {
+    if (dist < bestDist || (displayProjected() && dist == bestDist &&
+        displayByte(m_stopByte[i]) == displayByte(m_stopByte[best]))) {
       bestDist = dist;
       best = i;
     }
@@ -2927,6 +3065,7 @@ void Input::updateMultilineSelection() {
     float x1 = 0.0F;
     float y = 0.0F;
     float h = 0.0F;
+    int lineIndex = 0;
   };
   std::vector<LineSpan> lines;
   const std::size_t i0 = stopIndexForByte(selectionStart());
@@ -2937,15 +3076,15 @@ void Input::updateMultilineSelection() {
     const TextCursorStop& b = m_stopRect[i + 1];
     // A char whose next boundary sits on another line ends its line; highlight
     // it with a short stub (its true advance is not in the stop data).
-    const float boundaryX = sameLineY(a.y, b.y) ? b.x : a.x + stub;
+    const float boundaryX = a.lineIndex == b.lineIndex ? b.x : a.x + stub;
     const float spanStart = std::min(a.x, boundaryX);
     const float spanEnd = std::max(a.x, boundaryX);
-    if (!lines.empty() && sameLineY(lines.back().y, a.y)) {
+    if (!lines.empty() && lines.back().lineIndex == a.lineIndex) {
       lines.back().x0 = std::min(lines.back().x0, spanStart);
       lines.back().x1 = std::max(lines.back().x1, spanEnd);
-      lines.back().h = std::max(lines.back().h, a.height);
+      lines.back().h = std::max(lines.back().h, a.lineHeight);
     } else {
-      lines.push_back(LineSpan{spanStart, spanEnd, a.y, a.height});
+      lines.push_back(LineSpan{spanStart, spanEnd, a.lineY, a.lineHeight, a.lineIndex});
     }
   }
 
@@ -2955,6 +3094,52 @@ void Input::updateMultilineSelection() {
     RectNode* rect = m_selectionLineRects[i];
     rect->setPosition(span.x0, span.y + kMultilinePadV - m_scrollOffsetY);
     rect->setFrameSize(std::max(1.0F, span.x1 - span.x0), std::max(1.0F, span.h));
+    rect->setVisible(true);
+  }
+}
+
+void Input::updateProjectedSelection() {
+  if (!hasSelection() || m_textMetricsDirty || m_displayCells.size() != m_displayStopByte.size()) {
+    syncSelectionLineRects(0);
+    return;
+  }
+  const auto first = displayByte(selectionStart()), last = displayByte(selectionEnd());
+  std::vector<TextCursorStop> pieces;
+  for (std::size_t i = 0; i + 1 < m_displayStopByte.size(); ++i) {
+    if (m_displayStopByte[i] < first || m_displayStopByte[i] >= last ||
+        m_displayCells[i].cellWidth <= 0.0F) continue;
+    const auto& stop = m_displayCells[i];
+    const auto& next = m_displayCells[i + 1];
+    // Hard line breaks keep their selection marker; only inline whitespace can wrap away.
+    if (stop.cellIsVirtual && m_multiline && m_stopsBuiltForWidth > 0.0F) {
+      const auto character = g_utf8_get_char(m_displayProjection.text.data() + m_displayStopByte[i]);
+      if ((character == '\t' || g_unichar_type(character) == G_UNICODE_SPACE_SEPARATOR) &&
+          (next.lineIndex != stop.lineIndex || next.x == stop.x)) continue;
+    }
+    pieces.push_back(stop);
+  }
+  std::ranges::sort(pieces, [](const auto& a, const auto& b) {
+    return a.lineIndex == b.lineIndex ? a.cellX < b.cellX : a.lineIndex < b.lineIndex;
+  });
+  std::size_t count = 0;
+  for (const auto& piece : pieces) {
+    if (count > 0 && pieces[count - 1].lineIndex == piece.lineIndex &&
+        piece.cellX <= pieces[count - 1].cellX + pieces[count - 1].cellWidth + 0.5F) {
+      auto& previous = pieces[count - 1];
+      previous.cellWidth = std::max(previous.cellX + previous.cellWidth,
+                                    piece.cellX + piece.cellWidth) - previous.cellX;
+      previous.lineHeight = std::max(previous.lineHeight, piece.lineHeight);
+    } else {
+      pieces[count++] = piece;
+    }
+  }
+  syncSelectionLineRects(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto& piece = pieces[i];
+    auto* rect = m_selectionLineRects[i];
+    rect->setPosition(piece.cellX - (m_multiline ? 0.0F : m_scrollOffset - m_contentLeadSlack),
+                      piece.lineY + m_projectedOriginY - (m_multiline ? m_scrollOffsetY : 0.0F));
+    rect->setFrameSize(piece.cellWidth, std::max(1.0F, piece.lineHeight));
     rect->setVisible(true);
   }
 }
@@ -2972,6 +3157,7 @@ void Input::syncSelectionLineRects(std::size_t count) {
     auto rect = std::make_unique<RectNode>();
     rect->setStyle(m_selectionRect != nullptr ? m_selectionRect->style() : RoundedRectStyle{});
     rect->setOpacity(m_selectionBackground ? 1.0F : 0.3F);
+    rect->setZIndex(displayProjected() ? 1 : 0);
     rect->setVisible(false);
     auto* rectPtr = static_cast<RectNode*>(m_textViewport->insertChildAt(0, std::move(rect)));
     m_selectionLineRects.push_back(rectPtr);
@@ -2987,12 +3173,49 @@ float Input::stopXForByte(std::size_t bytePos) const {
   return m_stopX.empty() ? 0.0F : m_stopX.back();
 }
 
+std::size_t Input::displayByte(std::size_t rawByte) const noexcept {
+  if (!displayProjected() || m_displayProjection.rawToDisplay.empty()) return rawByte;
+  return m_displayProjection.rawToDisplay[std::min(rawByte, m_displayProjection.rawToDisplay.size() - 1)];
+}
+
+std::size_t Input::rawByteForDisplay(std::size_t displayOffset, bool trailing) const {
+  if (!displayProjected() || m_displayProjection.rawToDisplay.empty())
+    return clampToUtf8End(m_value, displayOffset);
+  const auto& map = m_displayProjection.rawToDisplay;
+  if (trailing) {
+    const auto it = std::ranges::upper_bound(map, displayOffset);
+    const auto raw = it == map.begin() ? 0 : static_cast<std::size_t>(it - map.begin() - 1);
+    return clampToUtf8Start(m_value, raw);
+  }
+  const auto it = std::ranges::lower_bound(map, displayOffset);
+  const auto raw = static_cast<std::size_t>(it - map.begin());
+  return clampToUtf8End(m_value, raw);
+}
+
+std::size_t Input::adjacentVisibleByte(std::size_t rawByte, bool left) const {
+  if (!displayProjected()) return left ? prevCharPos(m_value, rawByte) : nextCharPos(m_value, rawByte);
+  const auto offset = displayByte(rawByte);
+  auto next = rawByte;
+  do {
+    const auto previous = next;
+    next = left ? prevCharPos(m_value, next) : nextCharPos(m_value, next);
+    if (next == previous) return rawByte;
+  } while (displayByte(next) == offset);
+  // Metadata belongs to the boundary before the next displayed character.
+  while (next < m_value.size()) {
+    const auto following = nextCharPos(m_value, next);
+    if (displayByte(following) != displayByte(next)) break;
+    next = following;
+  }
+  return next;
+}
+
 std::size_t Input::visuallyAdjacentByte(std::size_t bytePos, bool left, bool wordStart) const {
   // A word move lands on the nearest word start on screen; the logical next or previous one can sit
   // on the other side of the caret when it lies on a bidi run boundary.
   std::vector<std::size_t> wordStarts;
   if (wordStart) {
-    std::size_t pos = 0;
+    std::size_t pos = rawByteForDisplay(0, true);
     wordStarts.push_back(pos);
     while (pos < m_value.size()) {
       const std::size_t next = nextWordStartForByteOffset(pos);
@@ -3004,6 +3227,10 @@ std::size_t Input::visuallyAdjacentByte(std::size_t bytePos, bool left, bool wor
     }
   }
   const float fromX = stopXForByte(bytePos);
+  if (displayProjected() && !wordStart) {
+    const auto adjacent = adjacentVisibleByte(bytePos, left);
+    if (adjacent != bytePos && stopXForByte(adjacent) == fromX) return adjacent;
+  }
   std::size_t best = bytePos;
   float bestX = fromX;
   bool found = false;
@@ -3014,7 +3241,8 @@ std::size_t Input::visuallyAdjacentByte(std::size_t bytePos, bool left, bool wor
     const float x = m_stopX[i];
     const bool ahead = left ? x < fromX - 0.5F : x > fromX + 0.5F;
     const bool closer = left ? x > bestX : x < bestX;
-    if (ahead && (!found || closer)) {
+    if (ahead && (!found || closer || (displayProjected() && x == bestX &&
+        displayByte(m_stopByte[i]) == displayByte(best)))) {
       best = m_stopByte[i];
       bestX = x;
       found = true;
@@ -3032,7 +3260,7 @@ bool Input::valueLaidOutRtl() const noexcept {
 bool Input::labelSlicingEnabled() const noexcept {
   // A slice is laid out on its own, which only lines up with the full-text stops when every stop
   // advances left to right with the byte offset.
-  return !Style::rtl() && m_stopsInLogicalOrder;
+  return !displayProjected() && !Style::rtl() && m_stopsInLogicalOrder;
 }
 
 float Input::restingScrollOffset() const {

@@ -55,7 +55,7 @@ namespace {
   }
 
   // Pack rgb into the top 24 bits; alpha is always forced to 0xFF so that
-  // opacity animations on a mixed-content string (the RGBA emoji path) reuse
+  // opacity animations on a mixed-content string (the RGBA emoji/markup path) reuse
   // the same cache entry — the caller's alpha is applied at draw time via
   // u_opacity instead of being baked into the raster.
   std::uint32_t packColorRgb(const Color& c) {
@@ -77,10 +77,19 @@ namespace {
     }
   }
 
-  bool containsColorGlyph(PangoLayout* layout) {
+  bool requiresRgba(PangoLayout* layout, bool useMarkup) {
     for (GSList* line = pango_layout_get_lines_readonly(layout); line != nullptr; line = line->next) {
       for (GSList* run = static_cast<PangoLayoutLine*>(line->data)->runs; run != nullptr; run = run->next) {
-        const auto* glyphs = static_cast<PangoGlyphItem*>(run->data)->glyphs;
+        const auto* item = static_cast<PangoGlyphItem*>(run->data);
+        if (useMarkup) {
+          for (GSList* attr = item->item->analysis.extra_attrs; attr != nullptr; attr = attr->next) {
+            const auto type = static_cast<PangoAttribute*>(attr->data)->klass->type;
+            if (type == PANGO_ATTR_FOREGROUND || type == PANGO_ATTR_BACKGROUND) {
+              return true;
+            }
+          }
+        }
+        const auto* glyphs = item->glyphs;
         for (int i = 0; i < glyphs->num_glyphs; ++i) {
           if (glyphs->glyphs[i].attr.is_color) {
             return true;
@@ -168,6 +177,7 @@ bool CairoTextRenderer::CacheKey::operator==(const CacheKey& other) const noexce
       && ellipsize == other.ellipsize
       && colorRgba == other.colorRgba
       && useMarkup == other.useMarkup
+      && coverageOnly == other.coverageOnly
       && text == other.text
       && font == other.font;
 }
@@ -184,6 +194,7 @@ std::size_t CairoTextRenderer::CacheKeyHash::operator()(const CacheKey& k) const
   hashCombine(seed, std::hash<std::uint8_t>{}(static_cast<std::uint8_t>(k.ellipsize)));
   hashCombine(seed, std::hash<std::uint32_t>{}(k.colorRgba));
   hashCombine(seed, std::hash<bool>{}(k.useMarkup));
+  hashCombine(seed, std::hash<bool>{}(k.coverageOnly));
   return seed;
 }
 
@@ -489,6 +500,8 @@ CairoTextRenderer::TextMetrics CairoTextRenderer::metricsFromLayout(float conten
   m.lineCount = pango_layout_get_line_count(layout);
   // Whole raster pixels, as rasterizeLayout's blockLeftPx.
   m.alignOffsetX = static_cast<float>(logical.x / PANGO_SCALE) * invScale;
+  m.layoutBaseline = static_cast<float>(baselinePango) * pscale * invScale;
+  m.layoutHeight = static_cast<float>(logical.height) * pscale * invScale;
   return m;
 }
 
@@ -629,7 +642,7 @@ void CairoTextRenderer::measureCursorStops(
 
 void CairoTextRenderer::measureCursorStopsWrapped(
     float contentScale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,
-    float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font, bool includeCells
+    float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font, bool includeCells, bool useMarkup
 ) {
   maybeSyncFontConfig();
   outStops.clear();
@@ -639,32 +652,61 @@ void CairoTextRenderer::measureCursorStopsWrapped(
     return;
   }
   const float fallbackHeight = fontSize > 0.0F ? fontSize : 1.0F;
-  if (m_pangoContext == nullptr || (text.empty() && !includeCells)) {
-    outStops.resize(byteOffsets.size(), TextCursorStop{0.0F, 0.0F, fallbackHeight});
+  if (m_pangoContext == nullptr) {
+    outStops.resize(
+        byteOffsets.size(), TextCursorStop{0.0F, 0.0F, fallbackHeight, 0.0F, 0.0F, 0, 0.0F, fallbackHeight}
+    );
     return;
   }
 
   // Same layout parameters as the draw path for a wrapping maxLines=0 text
   // node, so caret geometry matches rendered pixels.
-  PangoLayout* layout = buildLayout(contentScale, text, fontSize, font, maxWidth * contentScale, 0, TextAlign::Start);
+  PangoLayout* layout = buildLayout(
+      contentScale, text, fontSize, font, maxWidth * contentScale, 0, TextAlign::Start, TextEllipsize::End, useMarkup
+  );
+  const std::size_t textByteLength = useMarkup ? std::strlen(pango_layout_get_text(layout)) : text.size();
   const float invScale = 1.0F / contentScale;
   const float pscale = 1.0F / static_cast<float>(PANGO_SCALE);
+  // Cursor/index rectangles use run metrics; only iterator line extents give
+  // every mixed-font stop on a native row the same logical bounds.
+  m_cursorLineBounds.clear();
+  m_cursorLineBounds.reserve(static_cast<std::size_t>(pango_layout_get_line_count(layout)));
+  PangoLayoutIter* lineIter = pango_layout_get_iter(layout);
+  do {
+    PangoRectangle logical{};
+    pango_layout_iter_get_line_extents(lineIter, nullptr, &logical);
+    m_cursorLineBounds.push_back(
+        CursorLineBounds{
+            static_cast<float>(logical.y) * pscale * invScale,
+            static_cast<float>(logical.height) * pscale * invScale,
+        }
+    );
+  } while (pango_layout_iter_next_line(lineIter));
+  pango_layout_iter_free(lineIter);
   // Reuse native font/size/features/DPR-keyed metrics; no extra space layout on every edit.
   // End-of-line/empty slots use the font's real advance, not an em/monospace guess.
   const float spaceWidth = includeCells ? measure(contentScale, " ", fontSize, font).width : 0.0F;
   for (const std::size_t offset : byteOffsets) {
-    const std::size_t clampedOffset = std::min(offset, text.size());
+    const std::size_t clampedOffset = std::min(offset, textByteLength);
     const int index = clampedOffset > static_cast<std::size_t>(std::numeric_limits<int>::max())
         ? std::numeric_limits<int>::max()
         : static_cast<int>(clampedOffset);
     PangoRectangle strong{};
     PangoRectangle weak{};
     pango_layout_get_cursor_pos(layout, index, &strong, &weak);
+    int lineIndex = 0;
+    pango_layout_index_to_line_x(layout, index, false, &lineIndex, nullptr);
+    const auto& lineBounds = m_cursorLineBounds[static_cast<std::size_t>(lineIndex)];
     outStops.push_back(
         TextCursorStop{
             static_cast<float>(strong.x) * pscale * invScale,
             static_cast<float>(strong.y) * pscale * invScale,
             static_cast<float>(strong.height) * pscale * invScale,
+            0.0F,
+            0.0F,
+            lineIndex,
+            lineBounds.y,
+            lineBounds.height,
         }
     );
     if (includeCells) {
@@ -678,12 +720,11 @@ void CairoTextRenderer::measureCursorStopsWrapped(
       stop.cellX = std::min(x0, x1);
       stop.cellWidth = std::abs(x1 - x0);
       if (stop.cellWidth <= 0.0F) {
+        stop.cellIsVirtual = true;
         stop.cellWidth = spaceWidth;
         stop.cellX = stop.x;
         // A paragraph's end index has no character run; its strong insertion edge
         // follows the resolved line direction, not Pango's LTR run fallback.
-        int lineIndex = 0;
-        pango_layout_index_to_line_x(layout, index, false, &lineIndex, nullptr);
         auto* line = pango_layout_get_line_readonly(layout, lineIndex);
         if (line != nullptr && pango_layout_line_get_resolved_direction(line) == PANGO_DIRECTION_RTL)
           stop.cellX -= spaceWidth;
@@ -864,7 +905,7 @@ void CairoTextRenderer::rasterizeLayout(
   // color applied in shader (u_tint). Color-independent → one cache entry per
   // string serves every color animation state.
   // Untinted path: CAIRO_FORMAT_ARGB32 with `color` baked in, BGRA->RGBA
-  // swizzle, RGBA upload. Used for COLR color emoji.
+  // swizzle, RGBA upload. Used for COLR emoji and explicit markup run colors.
   const int bytesPerPixel = tinted ? 1 : 4;
   const int tightRowBytes = pxWidth * bytesPerPixel;
   std::vector<unsigned char> tight;
@@ -980,12 +1021,12 @@ void CairoTextRenderer::evictIfNeeded() {
 
 CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
     float contentScale, std::string_view text, float fontSize, const TextFont& font, float maxWidth, int maxLines,
-    TextAlign align, const Color& color, TextEllipsize ellipsize, bool useMarkup
+    TextAlign align, const Color& color, TextEllipsize ellipsize, bool useMarkup, bool coverageOnly
 ) {
   // Tinted (A8 coverage) entries are color-independent — the shader applies
   // u_tint at draw time, so one cache entry serves every color. RGBA entries
-  // (mixed content with COLR emoji) bake non-emoji ink color into the Cairo
-  // surface, so rgb must be part of the key. Alpha is normalized to 1.0 in
+  // (COLR emoji or explicit markup colors) bake default-colored ink into the
+  // Cairo surface, so rgb must be part of the key. Alpha is normalized to 1.0 in
   // the key AND in the rasterized source so opacity animations on mixed
   // strings still reuse one entry.
   CacheKey key;
@@ -998,22 +1039,43 @@ CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
   key.align = align;
   key.ellipsize = ellipsize;
   key.useMarkup = useMarkup;
+  key.coverageOnly = coverageOnly;
   auto it = m_cache.find(key);
   if (it != m_cache.end()) {
     touch(it);
     return &it->second;
   }
 
-  key.colorRgba = packColorRgb(color);
-  it = m_cache.find(key);
-  if (it != m_cache.end()) {
-    touch(it);
-    return &it->second;
+  if (!coverageOnly) {
+    key.colorRgba = packColorRgb(color);
+    it = m_cache.find(key);
+    if (it != m_cache.end()) {
+      touch(it);
+      return &it->second;
+    }
   }
 
   PangoLayout* layout =
       buildLayout(contentScale, text, fontSize, font, maxWidth * contentScale, maxLines, align, ellipsize, useMarkup);
-  const bool tinted = !containsColorGlyph(layout);
+  if (coverageOnly && useMarkup) {
+    if (PangoAttrList* attrs = pango_layout_get_attributes(layout); attrs != nullptr) {
+      // Keep native shaping attributes, but shadows must not paint run colors/backgrounds.
+      PangoAttrList* maskAttrs = pango_attr_list_copy(attrs);
+      PangoAttrList* colors = pango_attr_list_filter(
+          maskAttrs,
+          [](PangoAttribute* attr, gpointer) -> gboolean {
+            return attr->klass->type == PANGO_ATTR_FOREGROUND || attr->klass->type == PANGO_ATTR_BACKGROUND;
+          },
+          nullptr
+      );
+      if (colors != nullptr) {
+        pango_attr_list_unref(colors);
+      }
+      pango_layout_set_attributes(layout, maskAttrs);
+      pango_attr_list_unref(maskAttrs);
+    }
+  }
+  const bool tinted = coverageOnly || !requiresRgba(layout, useMarkup);
   if (tinted) {
     key.colorRgba = 0U;
   }
@@ -1054,15 +1116,16 @@ CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
 void CairoTextRenderer::draw(
     float contentScale, float surfaceWidth, float surfaceHeight, float x, float baselineY, std::string_view text,
     float fontSize, const Color& color, const Mat3& transform, const TextFont& font, float maxWidth, int maxLines,
-    TextAlign align, TextEllipsize ellipsize, bool useMarkup
+    TextAlign align, TextEllipsize ellipsize, bool useMarkup, bool coverageOnly
 ) {
   maybeSyncFontConfig();
   if (m_pangoContext == nullptr || m_backend == nullptr || text.empty()) {
     return;
   }
 
-  CacheEntry* entry =
-      lookupOrRasterize(contentScale, text, fontSize, font, maxWidth, maxLines, align, color, ellipsize, useMarkup);
+  CacheEntry* entry = lookupOrRasterize(
+      contentScale, text, fontSize, font, maxWidth, maxLines, align, color, ellipsize, useMarkup, coverageOnly
+  );
   if (entry == nullptr || entry->tiles.empty()) {
     return;
   }

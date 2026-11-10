@@ -43,7 +43,7 @@ public:
   // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
   void resetCaretEffects();
   void setAnimationManager(AnimationManager* manager) override;
-  // Native wrapped content height from the latest measure/layout, including viewport padding.
+  // Native wrapped logical height plus padding, floored by the same font strut for empty/nonempty text.
   float measuredMultilineHeight() const noexcept;
 
   struct EditSnapshot {
@@ -73,9 +73,34 @@ public:
   std::size_t cursorPosition() const noexcept { return m_cursorPos; }
   std::size_t selectionAnchor() const noexcept { return m_selectionAnchor; }
   bool composing() const noexcept { return m_preeditBase.has_value(); }
+  bool textGeometryDirty() const noexcept { return m_textMetricsDirty; }
+  static bool usesTextGeometry(std::uint32_t sym) noexcept;
   void setOnEditingStateChanged(std::function<void()> callback);
   // Runs before keyboard, clipboard, or IME insertion. Rejection changes no text/history.
   void setEditValidator(std::function<bool(std::string_view, std::string_view, bool)> validator);
+  struct DisplayProjection {
+    std::string text, markup, contrastMarkup;
+    // One entry per raw byte plus the end. Legal raw UTF-8 boundaries map
+    // monotonically to legal decoded-display UTF-8 boundaries, including duplicates.
+    std::vector<std::size_t> rawToDisplay;
+  };
+  // Trusted escaped Pango markup: both markup strings decode to text with identical shaping.
+  // contrastMarkup omits foreground/background colors for native contrast overlays.
+  // Password fields ignore projection; the raw document, history and IME stay native.
+  void setDisplayProjector(std::function<DisplayProjection(std::string_view)> projector);
+  // Rebuilds the cached projection after app style/theme changes without editing the document.
+  void refreshDisplayProjection();
+  // The cached result is replaced only by a display-text update or explicit refresh.
+  const DisplayProjection* displayProjection() const noexcept {
+    return displayProjected() ? &m_displayProjection : nullptr;
+  }
+  // Word commands use decoded display text but return legal raw boundaries.
+  // Backward starts trail leading metadata; forward ends precede trailing metadata.
+  // Ctrl+Right seeks the next start with trailing affinity, except at the terminal word end.
+  std::size_t projectedWordBoundary(std::size_t rawByte, bool forward) const;
+  // Rewrite real edit candidates before validation/commit, never history/restores.
+  // Cursor/anchor are raw UTF-8 bytes; bool is preedit. Rewritten candidates still pass the validator.
+  void setEditRewriter(std::function<void(const EditSnapshot&, EditSnapshot&, bool)> rewriter);
   void setFontFamily(std::string family);
   void setFontFeatures(std::string features);
   void setTextColors(std::optional<Color> foreground, std::optional<Color> selectionBackground,
@@ -155,9 +180,14 @@ private:
   };
 
   bool insertionAllowed(std::string_view text, bool preedit = false) const;
+  bool replaceTextRange(std::size_t start, std::size_t end, std::string_view text,
+                        EditCoalesceKind kind, bool preedit = false);
+  bool rewriteEdit(const EditSnapshot& before, EditSnapshot& after, bool preedit) const;
+  void trackPreeditRange(const EditSnapshot& before, std::size_t replacedStart, std::size_t replacedEnd);
 
   void doLayout(Renderer& renderer) override;
   LayoutSize doMeasure(Renderer& renderer, const LayoutConstraints& constraints) override;
+  void doRebindRenderer(Renderer& renderer) override { m_renderer = &renderer; }
   void handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers, bool preedit = false);
   void notifyTextInputStateChanged(TextInputChangeCause cause);
   bool removePreeditText();
@@ -195,8 +225,11 @@ private:
   std::size_t selectionEnd() const noexcept;
   bool isReadOnlyVisual() const noexcept;
   bool passwordMasked() const noexcept { return m_passwordMode && !m_passwordRevealed; }
+  bool displayProjected() const noexcept { return bool(m_displayProjector) && !m_passwordMode; }
+  std::size_t displayByte(std::size_t rawByte) const noexcept;
+  std::size_t rawByteForDisplay(std::size_t displayOffset, bool trailing) const;
+  std::size_t adjacentVisibleByte(std::size_t rawByte, bool left) const;
   EditSnapshot currentEditSnapshot() const;
-  void deleteSelection();
   void clearEditHistory();
   void resetUndoCoalescing();
   void pushUndoSnapshot(EditCoalesceKind kind);
@@ -229,6 +262,7 @@ private:
   void clampScrollOffsetY();
   void updateMultilineSelection();
   void syncSelectionLineRects(std::size_t count);
+  void updateProjectedSelection();
 
   void markTextContentChanged();
   void rebuildCursorStops(Renderer& renderer);
@@ -253,6 +287,11 @@ private:
 
   std::string m_value;
   std::string m_placeholder;
+  DisplayProjection m_displayProjection;
+  std::vector<std::size_t> m_displayStopByte;
+  std::vector<TextCursorStop> m_displayCells;
+  std::function<DisplayProjection(std::string_view)> m_displayProjector;
+  std::function<void(const EditSnapshot&, EditSnapshot&, bool)> m_editRewriter;
   std::size_t m_cursorPos = 0;
   std::size_t m_selectionAnchor = 0;
   std::size_t m_preeditStart = 0;
@@ -275,6 +314,16 @@ private:
   std::vector<TextCharSpan> m_charSpans;
   float m_stopsBuiltForWidth = -1.0F;
   bool m_textMetricsDirty = true;
+  bool m_logicalStrutDirty = true;
+  float m_logicalStrut = 0.0F;
+  float m_contentTextHeight = 0.0F;
+  float m_metricsRenderScale = 0.0F;
+  std::uint64_t m_metricsGeneration = 0;
+  // Hosts must rebind transient measurement views to their surface-owned renderer before input.
+  // That stable binding is reused to shape committed geometry after native preedit cancellation.
+  Renderer* m_renderer = nullptr;
+  float m_projectedLayoutBaseline = 0.0F;
+  float m_projectedOriginY = 0.0F;
   float m_cachedLabelY = 0.0F;
   std::string m_labelVisibleSlice;
   std::size_t m_labelVisibleStartByte = 0;

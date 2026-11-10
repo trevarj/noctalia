@@ -54,9 +54,11 @@ namespace {
     ) override {}
     void measureTextCursorStopsWrapped(
         std::string_view, float fontSize, const std::vector<std::size_t>& byteOffsets, float,
-        std::vector<TextCursorStop>& outStops, const TextFont&
+        std::vector<TextCursorStop>& outStops, const TextFont&, bool
     ) override {
-      outStops.assign(byteOffsets.size(), TextCursorStop{0.0F, 0.0F, fontSize});
+      outStops.assign(
+          byteOffsets.size(), TextCursorStop{0.0F, 0.0F, fontSize, 0.0F, 0.0F, 0, 0.0F, fontSize}
+      );
     }
     TextMetrics measureGlyph(char32_t, float fontSize) override {
       return TextMetrics{.width = fontSize, .bottom = fontSize};
