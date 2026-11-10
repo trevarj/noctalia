@@ -84,7 +84,8 @@ namespace {
         if (useMarkup) {
           for (GSList* attr = item->item->analysis.extra_attrs; attr != nullptr; attr = attr->next) {
             const auto type = static_cast<PangoAttribute*>(attr->data)->klass->type;
-            if (type == PANGO_ATTR_FOREGROUND || type == PANGO_ATTR_BACKGROUND) {
+            if (type == PANGO_ATTR_FOREGROUND || type == PANGO_ATTR_BACKGROUND ||
+                type == PANGO_ATTR_UNDERLINE_COLOR) {
               return true;
             }
           }

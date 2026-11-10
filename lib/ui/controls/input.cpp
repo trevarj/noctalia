@@ -528,7 +528,20 @@ void Input::setDisplayProjector(std::function<DisplayProjection(std::string_view
   refreshDisplayProjection();
 }
 
-void Input::refreshDisplayProjection() {
+void Input::refreshDisplayProjection(bool decorationOnly) {
+  if (decorationOnly && displayProjected()) {
+    auto projection = m_displayProjector(m_value);
+    if (projection.text == m_displayProjection.text &&
+        projection.rawToDisplay == m_displayProjection.rawToDisplay) {
+      m_displayProjection = std::move(projection);
+      if (!m_value.empty() || m_placeholder.empty()) m_label->setText(m_displayProjection.markup);
+      for (auto& item : m_selectionText)
+        if (item.label) item.label->setText(m_displayProjection.contrastMarkup);
+      if (m_caretText.label) m_caretText.label->setText(m_displayProjection.contrastMarkup);
+      markPaintDirty();
+      return;
+    }
+  }
   resetCaretEffects();
   updateDisplayText();
   markTextContentChanged();
@@ -718,7 +731,7 @@ bool Input::replaceTextRange(std::size_t start, std::size_t end, std::string_vie
     }
     return true;
   }
-  if (m_editValidator && !text.empty()) {
+  if (m_editValidator) {
     auto after = m_value;
     after.replace(start, end - start, text);
     if (!m_editValidator(m_value, after, preedit)) return false;
@@ -746,6 +759,44 @@ bool Input::insertText(std::string_view text) {
   notifyTextInputStateChanged(TextInputChangeCause::Other);
   if (m_onChange) m_onChange(m_value);
   return true;
+}
+
+bool Input::replaceRange(std::size_t rawBegin, std::size_t rawEnd, std::string_view text) {
+  if (composing() || rawBegin > rawEnd || rawEnd > m_value.size() ||
+      clampToUtf8Start(m_value, rawBegin) != rawBegin ||
+      clampToUtf8Start(m_value, rawEnd) != rawEnd ||
+      (!text.empty() && !g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr))) return false;
+  if (!replaceTextRange(rawBegin, rawEnd, text, EditCoalesceKind::Discrete)) return false;
+  updateDisplayText();
+  markTextContentChanged();
+  revealCursor();
+  notifyTextInputStateChanged(TextInputChangeCause::Other);
+  if (m_onChange) m_onChange(m_value);
+  return true;
+}
+
+std::optional<std::size_t> Input::textByteAtPoint(float localX, float localY) const {
+  if (composing() || m_textMetricsDirty || m_passwordMode || m_value.empty() ||
+      !std::isfinite(localX) || !std::isfinite(localY)) return std::nullopt;
+  const float textStartX = m_horizontalPadding + kTextInnerInset;
+  const float viewportHeight = m_multiline ? std::max(0.0F, height() - 2.0F * kMultilinePadV) : height();
+  const float viewportY = m_multiline ? kMultilinePadV : 0.0F;
+  if (localX < textStartX || localX >= textStartX + textViewportWidth() ||
+      localY < viewportY || localY >= viewportY + viewportHeight) return std::nullopt;
+  const float x = localX - textStartX + (m_multiline ? 0.0F : m_scrollOffset - m_contentLeadSlack);
+  const float y = localY - m_projectedOriginY + (m_multiline ? m_scrollOffsetY : 0.0F);
+  const auto& cells = displayProjected() ? m_displayCells : (m_multiline ? m_stopRect : m_caretCells);
+  const auto& bytes = displayProjected() ? m_displayStopByte : m_stopByte;
+  if (cells.size() != bytes.size()) return std::nullopt;
+  for (std::size_t i = 0; i + 1 < cells.size(); ++i) {
+    const auto& cell = cells[i];
+    if (cell.cellIsVirtual || cell.cellWidth <= 0.0F ||
+        x < cell.cellX || x >= cell.cellX + cell.cellWidth ||
+        y < cell.lineY || y >= cell.lineY + cell.lineHeight) continue;
+    const auto raw = rawByteForDisplay(bytes[i], true);
+    if (raw < m_value.size()) return raw;
+  }
+  return std::nullopt;
 }
 
 void Input::setInlineGhost(std::string text) {
@@ -1182,6 +1233,8 @@ void Input::markTextContentChanged() {
 
 void Input::rebuildCursorStopsFull(Renderer& renderer) {
   const bool showPasswordGlyphs = passwordMasked() && !m_value.empty();
+  // A font/DPR change must remeasure the painted slice's baseline even if its text is unchanged.
+  if (!m_multiline && !displayProjected()) m_labelVisibleSlice.clear();
   m_stopByte.clear();
   m_stopX.clear();
   m_stopRect.clear();
@@ -1251,15 +1304,9 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
   }
 
   if (m_multiline) {
-    if (m_caretShape == CaretShape::Line) {
-      renderer.measureTextCursorStopsWrapped(
-          m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
-      );
-    } else {
-      renderer.measureTextCaretStops(
-          m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
-      );
-    }
+    renderer.measureTextCaretStops(
+        m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
+    );
     if (m_stopRect.size() != m_stopByte.size()) {
       m_stopRect.assign(m_stopByte.size(),
                         TextCursorStop{.height = m_logicalStrut, .lineHeight = m_logicalStrut});
@@ -1267,17 +1314,14 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
     m_stopX.resize(m_stopRect.size());
     for (std::size_t i = 0; i < m_stopRect.size(); ++i) m_stopX[i] = m_stopRect[i].x;
     const auto metrics = renderer.measureText(m_value, m_fontSize, m_label->font(), m_stopsBuiltForWidth);
+    m_projectedLayoutBaseline = metrics.layoutBaseline;
     m_multilineLabelX = metrics.alignOffsetX;
     m_contentTextHeight = metrics.layoutHeight;
   } else if (!showPasswordGlyphs) {
-    if (m_caretShape == CaretShape::Line) {
-      renderer.measureTextCursorStops(m_value, m_fontSize, m_stopByte, m_stopX, m_label->font());
-    } else {
-      renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
-      m_stopX.clear();
-      m_stopX.reserve(m_caretCells.size());
-      for (const auto& stop : m_caretCells) m_stopX.push_back(stop.x);
-    }
+    renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
+    m_stopX.clear();
+    m_stopX.reserve(m_caretCells.size());
+    for (const auto& stop : m_caretCells) m_stopX.push_back(stop.x);
     if (m_stopX.size() != m_stopByte.size()) m_stopX.assign(m_stopByte.size(), 0.0F);
     m_stopsInLogicalOrder = std::ranges::is_sorted(m_stopX);
     if (!m_stopsInLogicalOrder)
@@ -1388,6 +1432,7 @@ void Input::updateLabelVisibleSlice(Renderer& renderer) {
     m_labelVisibleSlice = slice;
     m_label->setText(m_labelVisibleSlice);
     m_label->measure(renderer);
+    m_projectedLayoutBaseline = renderer.measureText(m_labelVisibleSlice, m_fontSize, m_label->font()).layoutBaseline;
     const float h = m_controlHeight;
     m_cachedLabelY = std::round((h - m_label->height()) * 0.5F);
   }
@@ -1467,8 +1512,8 @@ void Input::doLayout(Renderer& renderer) {
       updateLabelVisibleSlice(renderer);
     }
   }
-  if (displayProjected()) {
-    m_projectedOriginY = m_displayProjection.text.empty()
+  if (!showPasswordGlyphs) {
+    m_projectedOriginY = m_value.empty()
         ? (m_multiline ? kMultilinePadV : std::round((h - m_logicalStrut) * 0.5F))
         : m_cachedLabelY + m_label->baselineOffset() -
             std::floor(m_projectedLayoutBaseline * m_cursorRenderScale) / m_cursorRenderScale;

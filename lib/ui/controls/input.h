@@ -71,6 +71,10 @@ public:
   // Same-document peers can restore shared text/history while retaining their own viewport.
   void restoreEditingState(const EditingState& state, bool preserveScroll = false);
   bool insertText(std::string_view text);
+  // Raw committed UTF-8 byte under an actual visible shaped cell, never a nearest caret.
+  std::optional<std::size_t> textByteAtPoint(float localX, float localY) const;
+  // Discrete native edit; invalid UTF-8 boundaries and active composition are rejected.
+  bool replaceRange(std::size_t rawBegin, std::size_t rawEnd, std::string_view text);
   std::size_t cursorPosition() const noexcept { return m_cursorPos; }
   std::size_t selectionAnchor() const noexcept { return m_selectionAnchor; }
   bool composing() const noexcept { return m_preeditBase.has_value(); }
@@ -89,8 +93,8 @@ public:
   // contrastMarkup omits foreground/background colors for native contrast overlays.
   // Password fields ignore projection; the raw document, history and IME stay native.
   void setDisplayProjector(std::function<DisplayProjection(std::string_view)> projector);
-  // Rebuilds the cached projection after app style/theme changes without editing the document.
-  void refreshDisplayProjection();
+  // Decoration-only refresh preserves native geometry/effects when text and mapping are unchanged.
+  void refreshDisplayProjection(bool decorationOnly = false);
   // The cached result is replaced only by a display-text update or explicit refresh.
   const DisplayProjection* displayProjection() const noexcept {
     return displayProjected() ? &m_displayProjection : nullptr;
