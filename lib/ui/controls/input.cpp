@@ -409,12 +409,14 @@ Input::Input() {
 }
 
 Input::~Input() {
+  resetCaretEffects();
   if (m_textInputService != nullptr) {
     m_textInputService->clearFocusedClient(this);
   }
 }
 
 void Input::setValue(std::string_view value) {
+  resetCaretEffects();
   m_value = std::string(value);
   m_cursorPos = m_value.size();
   m_selectionAnchor = m_cursorPos;
@@ -448,7 +450,9 @@ bool Input::editingStateMatches(const EditingState& state) const noexcept {
       m_scrollOffsetY == state.scrollY;
 }
 
-void Input::restoreEditingState(const EditingState& state) {
+void Input::restoreEditingState(const EditingState& state, bool preserveScroll) {
+  // Same-document model commands are real caret moves, not buffer switches.
+  if (!preserveScroll || state.history != m_editHistory) resetCaretEffects();
   m_value = state.current.value;
   m_cursorPos = state.current.cursorPos;
   m_selectionAnchor = state.current.selectionAnchor;
@@ -457,8 +461,10 @@ void Input::restoreEditingState(const EditingState& state) {
   m_preeditStart = state.preeditStart;
   m_preeditLen = state.preeditLength;
   m_editHistory = state.history ? state.history : std::make_shared<EditHistory>();
-  m_scrollOffset = state.scrollX;
-  m_scrollOffsetY = state.scrollY;
+  if (!preserveScroll) {
+    m_scrollOffset = state.scrollX;
+    m_scrollOffsetY = state.scrollY;
+  }
   clampEditState();
   resetUndoCoalescing();
   updateDisplayText();
@@ -477,8 +483,62 @@ void Input::setEditValidator(std::function<bool(std::string_view, std::string_vi
   m_editValidator = std::move(validator);
 }
 
-void Input::setFontFamily(std::string family) { m_label->setFontFamily(std::move(family)); markTextContentChanged(); }
-void Input::setFontFeatures(std::string features) { m_label->setFontFeatures(std::move(features)); markTextContentChanged(); }
+void Input::setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs, float strength) {
+  if (shape != CaretShape::Box && shape != CaretShape::Underline) shape = CaretShape::Line;
+  if (effect != CaretEffect::Trail && effect != CaretEffect::Comet &&
+      effect != CaretEffect::Ribbon && effect != CaretEffect::Pulse) effect = CaretEffect::Off;
+  const float duration = input_caret::duration(durationMs), amount = input_caret::strength(strength);
+  if (m_caretShape == shape && m_caretEffect == effect &&
+      m_caretDuration == duration && m_caretStrength == amount) {
+    if (!MotionService::instance().enabled()) {
+      m_cursorBlinkTimer.stop();
+      m_cursorBlinkVisible = true;
+      updateCursorVisibility();
+    }
+    return;
+  }
+  resetCaretEffects();
+  const bool shapeChanged = m_caretShape != shape;
+  m_caretShape = shape;
+  m_caretEffect = effect;
+  m_caretDuration = duration;
+  m_caretStrength = amount;
+  if (effect != CaretEffect::Off && m_caretStamps.front() == nullptr) {
+    for (auto& stamp : m_caretStamps) {
+      auto node = std::make_unique<RectNode>();
+      node->setVisible(false);
+      node->setHitTestVisible(false);
+      stamp = static_cast<RectNode*>(m_textViewport->addChild(std::move(node)));
+    }
+  }
+  if (shapeChanged) m_textMetricsDirty = true;
+  applyVisualState();
+  updateInteractiveGeometry();
+  markLayoutDirty();
+}
+
+void Input::resetCaretEffects() {
+  if (m_caretAnimation != 0 && animationManager() != nullptr) animationManager()->cancel(m_caretAnimation);
+  m_caretAnimation = 0;
+  m_caretTrail.reset();
+  for (auto* stamp : m_caretStamps) if (stamp != nullptr) stamp->setVisible(false);
+}
+
+void Input::setAnimationManager(AnimationManager* manager) {
+  if (manager != animationManager()) resetCaretEffects();
+  Node::setAnimationManager(manager);
+}
+
+void Input::setFontFamily(std::string family) {
+  if (m_label->font().family != family) resetCaretEffects();
+  m_label->setFontFamily(std::move(family));
+  markTextContentChanged();
+}
+void Input::setFontFeatures(std::string features) {
+  if (m_label->font().features != features) resetCaretEffects();
+  m_label->setFontFeatures(std::move(features));
+  markTextContentChanged();
+}
 
 void Input::setTextColors(std::optional<Color> foreground, std::optional<Color> selectionBackground,
                           std::optional<Color> selectionForeground, std::optional<Color> caret) {
@@ -492,39 +552,52 @@ void Input::setTextColors(std::optional<Color> foreground, std::optional<Color> 
   markLayoutDirty();
 }
 
-void Input::updateSelectionText(Renderer& renderer) {
+void Input::updateClippedText(Renderer& renderer, RectNode* rect, SelectionText& item, Color color) {
+  if (item.clip == nullptr) {
+    auto clip = std::make_unique<Node>();
+    clip->setClipChildren(true);
+    clip->setHitTestVisible(false);
+    auto label = std::make_unique<Label>();
+    label->setUseMarkup(false);
+    item.label = static_cast<Label*>(clip->addChild(std::move(label)));
+    item.clip = m_textViewport->addChild(std::move(clip));
+  }
+  item.clip->setVisible(rect->visible());
+  item.clip->setPosition(rect->x(), rect->y());
+  item.clip->setFrameSize(rect->width(), rect->height());
+  item.label->setText(m_label->text());
+  item.label->setFontSize(m_fontSize);
+  if (item.label->font().family != m_label->font().family)
+    item.label->setFontFamily(m_label->font().family);
+  if (item.label->font().features != m_label->font().features)
+    item.label->setFontFeatures(m_label->font().features);
+  item.label->setFontWeight(m_label->font().weight);
+  item.label->setTextAlign(m_label->textAlign());
+  item.label->setMaxLines(m_multiline ? 0 : 1);
+  item.label->setMaxWidth(m_label->maxWidth());
+  item.label->setColor(color);
+  item.label->measure(renderer);
+  item.label->setPosition(m_label->x() - rect->x(), m_label->y() - rect->y());
+}
+
+void Input::updateTextOverlays(Renderer& renderer) {
   std::size_t used = 0;
   auto overlay = [&](RectNode* rect) {
     if (!m_selectionForeground || !hasSelection() || passwordMasked() || !rect->visible() ||
         rect->y() + rect->height() <= 0 || rect->y() >= m_textViewport->height()) return;
-    if (used == m_selectionText.size()) {
-      auto clip = std::make_unique<Node>();
-      clip->setClipChildren(true);
-      clip->setHitTestVisible(false);
-      auto label = std::make_unique<Label>();
-      auto* labelPtr = static_cast<Label*>(clip->addChild(std::move(label)));
-      auto* clipPtr = m_textViewport->addChild(std::move(clip));
-      m_selectionText.push_back({clipPtr, labelPtr});
-    }
-    auto& item = m_selectionText[used++];
-    item.clip->setVisible(true);
-    item.clip->setPosition(rect->x(), rect->y());
-    item.clip->setFrameSize(rect->width(), rect->height());
-    item.label->setText(m_label->text());
-    item.label->setFontSize(m_fontSize);
-    item.label->setFontFamily(m_label->font().family);
-    item.label->setFontFeatures(m_label->font().features);
-    item.label->setFontWeight(m_label->font().weight);
-    item.label->setTextAlign(m_label->textAlign());
-    item.label->setMaxLines(m_multiline ? 0 : 1);
-    item.label->setMaxWidth(m_label->maxWidth());
-    item.label->setColor(*m_selectionForeground);
-    item.label->measure(renderer);
-    item.label->setPosition(m_label->x() - rect->x(), m_label->y() - rect->y());
+    if (used == m_selectionText.size()) m_selectionText.push_back({});
+    updateClippedText(renderer, rect, m_selectionText[used++], *m_selectionForeground);
   };
   overlay(m_selectionRect);
   for (auto* rect : m_selectionLineRects) overlay(rect);
   for (; used < m_selectionText.size(); ++used) m_selectionText[used].clip->setVisible(false);
+  if (m_caretShape == CaretShape::Box && caretPaintEligible() && !m_value.empty() && !passwordMasked()) {
+    updateClippedText(renderer, m_cursor, m_caretText,
+                      readableTextColorForBackground(m_cursor->style().fill));
+    m_caretText.clip->setZIndex(2);
+  } else if (m_caretText.clip != nullptr) {
+    m_caretText.clip->setVisible(false);
+  }
 }
 
 bool Input::insertionAllowed(std::string_view text, bool preedit) const {
@@ -570,6 +643,7 @@ void Input::setFontSize(float size) {
   if (m_fontSize == next) {
     return;
   }
+  resetCaretEffects();
   m_fontSize = next;
   if (m_label != nullptr) {
     m_label->setFontSize(m_fontSize);
@@ -582,12 +656,15 @@ void Input::setControlHeight(float height) {
   if (m_controlHeight == next) {
     return;
   }
+  resetCaretEffects();
   m_controlHeight = next;
   markLayoutDirty();
 }
 
 void Input::setHorizontalPadding(float padding) {
-  m_horizontalPadding = std::max(0.0F, padding);
+  const float next = std::max(0.0F, padding);
+  if (next != m_horizontalPadding) resetCaretEffects();
+  m_horizontalPadding = next;
   markLayoutDirty();
 }
 
@@ -636,6 +713,7 @@ void Input::setMultiline(bool enabled) {
   if (m_multiline == enabled) {
     return;
   }
+  resetCaretEffects();
   m_multiline = enabled;
   if (enabled && m_passwordMode) {
     m_passwordMode = false;
@@ -692,6 +770,7 @@ void Input::setEmbeddedOnSolidPrimary(bool embedded) {
 
 void Input::setFontWeight(FontWeight fontWeight) {
   if (m_label != nullptr) {
+    if (m_label->font().weight != fontWeight) resetCaretEffects();
     m_label->setFontWeight(fontWeight);
   }
   markTextContentChanged();
@@ -720,6 +799,12 @@ void Input::setOnSubmit(std::function<void(const std::string&)> callback) { m_on
 
 void Input::setOnKeyEvent(std::function<bool(std::uint32_t, std::uint32_t)> callback) {
   m_onKeyEvent = std::move(callback);
+}
+
+void Input::setOnContextMenu(std::function<void(const InputArea::PointerData*)> callback) {
+  m_onContextMenu = std::move(callback);
+  m_inputArea->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT) |
+      (m_onContextMenu ? InputArea::buttonMask(BTN_RIGHT) : 0));
 }
 
 void Input::setOnFocusLoss(std::function<void()> callback) { m_onFocusLoss = std::move(callback); }
@@ -844,14 +929,12 @@ TextInputState Input::textInputState() const {
   if (m_textViewport != nullptr) {
     Node::absolutePosition(m_textViewport, cursorSceneX, cursorSceneY);
   }
-  if (m_cursor != nullptr) {
-    cursorSceneX += m_cursor->x();
-    cursorSceneY += m_cursor->y();
-  }
+  cursorSceneX += m_caretInsertionRect.x;
+  cursorSceneY += m_caretInsertionRect.y;
 
   const bool password = m_passwordMode;
-  const float cursorWidth = m_cursor != nullptr ? m_cursor->width() : 1.0F;
-  const float cursorHeight = m_cursor != nullptr ? m_cursor->height() : m_controlHeight;
+  const float cursorWidth = m_caretInsertionRect.width;
+  const float cursorHeight = m_caretInsertionRect.height;
   return TextInputState{
       .surroundingText = password ? std::string{} : std::move(surrounding),
       .cursor = byteOffsetToProtocolInt(cursor),
@@ -964,6 +1047,7 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
   m_stopX.clear();
   m_stopRect.clear();
   m_charSpans.clear();
+  m_caretCells.clear();
   m_stopByte.push_back(0);
   m_stopX.push_back(0.0F);
   m_stopsInLogicalOrder = true;
@@ -971,6 +1055,9 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
   m_multilineLabelX = 0.0F;
 
   if (m_value.empty()) {
+    if (m_caretShape != CaretShape::Line && !showPasswordGlyphs) {
+      renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
+    }
     if (m_multiline) {
       m_stopRect.push_back(TextCursorStop{0.0F, 0.0F, renderer.fontRowExtent(m_fontSize, m_label->font())});
     }
@@ -989,9 +1076,15 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
     }
   }
   if (m_multiline) {
-    renderer.measureTextCursorStopsWrapped(
-        m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
-    );
+    if (m_caretShape == CaretShape::Line) {
+      renderer.measureTextCursorStopsWrapped(
+          m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
+      );
+    } else {
+      renderer.measureTextCaretStops(
+          m_value, m_fontSize, m_stopByte, m_stopsBuiltForWidth, m_stopRect, m_label->font()
+      );
+    }
     if (m_stopRect.size() != m_stopByte.size()) {
       m_stopRect.assign(m_stopByte.size(), TextCursorStop{0.0F, 0.0F, m_fontSize});
     }
@@ -1003,7 +1096,14 @@ void Input::rebuildCursorStopsFull(Renderer& renderer) {
     // right-aligned (RTL paragraphs in an LTR UI) that line starts inside the viewport.
     m_multilineLabelX = renderer.measureText(m_value, m_fontSize, m_label->font(), m_stopsBuiltForWidth).alignOffsetX;
   } else if (!showPasswordGlyphs) {
-    renderer.measureTextCursorStops(m_value, m_fontSize, m_stopByte, m_stopX, m_label->font());
+    if (m_caretShape == CaretShape::Line) {
+      renderer.measureTextCursorStops(m_value, m_fontSize, m_stopByte, m_stopX, m_label->font());
+    } else {
+      renderer.measureTextCaretStops(m_value, m_fontSize, m_stopByte, 0.0F, m_caretCells, m_label->font());
+      m_stopX.clear();
+      m_stopX.reserve(m_caretCells.size());
+      for (const auto& stop : m_caretCells) m_stopX.push_back(stop.x);
+    }
     if (m_stopX.size() != m_stopByte.size()) {
       m_stopX.assign(m_stopByte.size(), 0.0F);
     }
@@ -1235,13 +1335,20 @@ void Input::doLayout(Renderer& renderer) {
   updateInteractiveGeometry();
   applyVisualState();
   updateCursorVisibility();
-  updateSelectionText(renderer);
+  updateTextOverlays(renderer);
 }
 
 void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers, bool preedit) {
   // onSubmit/onKeyEvent below can synchronously destroy this Input (e.g. closing a
   // dialog that owns it). Bail before touching members if that happens.
   const std::weak_ptr<int> alive = m_aliveToken;
+  if (sym == XKB_KEY_Menu || (sym == XKB_KEY_F10 && modifiers == KeyMod::Shift)) {
+    if (m_onContextMenu) {
+      auto callback = m_onContextMenu;
+      callback(nullptr);
+    }
+    return;
+  }
   clampEditState();
 
   const bool validateMatch = g_validateKeyMatcher && g_validateKeyMatcher(sym, modifiers);
@@ -1701,11 +1808,7 @@ void Input::applyVisualState() {
       rect->setStyle(selectionStyleEmb);
     }
 
-    auto cursorStyleEmb = m_cursor->style();
-    cursorStyleEmb.fill = resolved(ColorRole::Surface);
-    cursorStyleEmb.fillMode = FillMode::Solid;
-    cursorStyleEmb.radius = 0.0F;
-    m_cursor->setStyle(cursorStyleEmb);
+    applyCaretStyle(resolved(ColorRole::Surface));
 
     const bool showingPlaceholder = m_value.empty() && !m_placeholder.empty();
     if (m_invalid) {
@@ -1741,11 +1844,7 @@ void Input::applyVisualState() {
     rect->setOpacity(m_selectionBackground ? 1.0F : 0.3F);
   }
 
-  auto cursorStyle = m_cursor->style();
-  cursorStyle.fill = m_caretColor.value_or(resolved(ColorRole::Primary));
-  cursorStyle.fillMode = FillMode::Solid;
-  cursorStyle.radius = 0.0F;
-  m_cursor->setStyle(cursorStyle);
+  applyCaretStyle(m_caretColor.value_or(resolved(ColorRole::Primary)));
 
   const bool showingPlaceholder = m_value.empty() && !m_placeholder.empty();
   const ColorSpec textColor = m_invalid
@@ -1818,6 +1917,161 @@ void Input::clearFromButton() {
   }
 }
 
+bool Input::caretPaintEligible() const {
+  if (!m_enabled || m_inputArea == nullptr || !m_inputArea->focused() || hasSelection() || m_preeditCaretHidden)
+    return false;
+  for (const Node* node = this; node != nullptr; node = node->parent()) if (!node->visible()) return false;
+  return true;
+}
+
+LayoutRect Input::caretViewport() const {
+  float x = 0.0F, y = 0.0F;
+  Node::absolutePosition(m_textViewport, x, y);
+  return {x, y, textViewportWidth(), m_textViewport->height()};
+}
+
+void Input::applyCaretStyle(Color color) {
+  RoundedRectStyle style{
+      .fill = color,
+      .fillMode = FillMode::Solid,
+      .radius = 0.0F,
+      .noAa = true,
+  };
+  m_cursor->setStyle(style);
+  for (auto* stamp : m_caretStamps) if (stamp != nullptr) stamp->setStyle(style);
+  if (m_caretText.label != nullptr)
+    m_caretText.label->setColor(readableTextColorForBackground(color));
+}
+
+void Input::updateCaretPaint(float cellX, float cellWidth) {
+  const auto viewport = caretViewport();
+  if (!input_caret::equal(viewport, m_caretTrailViewport) || m_caretTrailScale != m_cursorRenderScale ||
+      m_caretTrailScrollX != m_scrollOffset || m_caretTrailScrollY != m_scrollOffsetY) {
+    resetCaretEffects();
+    m_caretTrailViewport = viewport;
+    m_caretTrailScale = m_cursorRenderScale;
+    m_caretTrailScrollX = m_scrollOffset;
+    m_caretTrailScrollY = m_scrollOffsetY;
+  }
+  auto rect = m_caretInsertionRect;
+  if (m_caretShape != CaretShape::Line) {
+    // Keep a thin insertion edge when an end slot lies entirely beyond either
+    // viewport edge; moving the full cell inward would cover the preceding glyph.
+    const bool outside = cellX >= textViewportWidth() || cellX + cellWidth <= 0.0F;
+    rect.x = outside ? m_caretInsertionRect.x : cellX;
+    if (!outside) rect.width = std::max(rect.width, cellWidth);
+    if (m_caretShape == CaretShape::Underline) {
+      const float stroke = std::min(rect.height, m_caretInsertionRect.width);
+      rect.y += rect.height - stroke;
+      rect.height = stroke;
+    }
+  }
+  rect.x += viewport.x;
+  rect.y += viewport.y;
+  rect = input_caret::clippedPixels(rect, viewport, m_cursorRenderScale);
+  rect.x -= viewport.x;
+  rect.y -= viewport.y;
+  m_cursor->setPosition(rect.x, rect.y);
+  m_cursor->setFrameSize(rect.width, rect.height);
+  if (m_caretText.clip != nullptr) {
+    m_caretText.clip->setPosition(rect.x, rect.y);
+    m_caretText.clip->setFrameSize(rect.width, rect.height);
+    m_caretText.label->setPosition(m_label->x() - rect.x, m_label->y() - rect.y);
+  }
+  auto* animations = animationManager();
+  const bool allowed = m_caretEffect != CaretEffect::Off && animations != nullptr &&
+                       MotionService::instance().enabled() && caretPaintEligible() && !composing();
+  if (!allowed) {
+    resetCaretEffects();
+    return;
+  }
+  // A restored/edited value is placed immediately, but trails only use freshly shaped cells.
+  if (m_textMetricsDirty) return;
+  if (rect.width <= 0.0F || rect.height <= 0.0F) {
+    resetCaretEffects();
+    return;
+  }
+  if (!m_caretTrail.move(rect, true)) return;
+  if (m_caretAnimation != 0) animations->cancel(m_caretAnimation);
+  paintCaretTrail(0.0F);
+  m_caretAnimation = animations->animate(
+      // Display-calibrated milliseconds, retaining native reduced-motion completion.
+      0.0F, 1.0F, m_caretDuration * MotionService::instance().speed(), Easing::Linear,
+      [this](float progress) { paintCaretTrail(progress); }, {}, this
+  );
+}
+
+void Input::paintCaretTrail(float progress) {
+  const auto viewport = caretViewport();
+  const bool motion = MotionService::instance().enabled();
+  if (!motion || !caretPaintEligible() || composing() || m_caretEffect == CaretEffect::Off ||
+      !input_caret::equal(viewport, m_caretTrailViewport) ||
+      m_caretTrailScale != m_cursorRenderScale || m_caretTrailScrollX != m_scrollOffset ||
+      m_caretTrailScrollY != m_scrollOffsetY) m_caretTrail.reset();
+  if (!motion) {
+    m_cursorBlinkVisible = true;
+    m_cursor->setVisible(caretPaintEligible());
+    if (m_caretText.clip != nullptr)
+      m_caretText.clip->setVisible(m_cursor->visible() && m_caretShape == CaretShape::Box &&
+                                  !m_value.empty() && !passwordMasked() && !m_textMetricsDirty);
+  }
+  if (progress >= 1.0F) {
+    m_caretTrail.active = false;
+    m_caretAnimation = 0;
+  }
+  for (std::size_t i = 0; i < m_caretStamps.size(); ++i) {
+    auto* stamp = m_caretStamps[i];
+    if (stamp == nullptr) continue;
+    auto rect = m_caretTrail.sample(progress, i);
+    float rotation = 0.0F;
+    if (m_caretEffect == CaretEffect::Trail) {
+      rect.x += viewport.x;
+      rect.y += viewport.y;
+      rect = input_caret::clippedPixels(rect, viewport, m_cursorRenderScale);
+      rect.x -= viewport.x;
+      rect.y -= viewport.y;
+    } else {
+      // Six retained connected segments, clipped by the native text viewport.
+      const float p = std::clamp(progress, 0.0F, 1.0F);
+      const float a = static_cast<float>(i) / input_caret::Trail::count;
+      const float b = static_cast<float>(i + 1) / input_caret::Trail::count;
+      const auto start = m_caretTrail.sample(p, i);
+      const auto end = i + 1 == input_caret::Trail::count ? m_caretTrail.to
+                                                       : m_caretTrail.sample(p, i + 1);
+      float x1 = start.x + start.width * .5F, y1 = start.y + start.height * .5F;
+      float x2 = end.x + end.width * .5F, y2 = end.y + end.height * .5F;
+      float thickness = std::max(1.0F / m_cursorRenderScale, m_caretTrail.to.height * .10F);
+      if (m_caretEffect == CaretEffect::Pulse) {
+        constexpr float tau = 6.28318530718F;
+        const float radius = m_caretTrail.to.height * (.20F + .65F * p);
+        const float cx = m_caretTrail.to.x + m_caretTrail.to.width * .5F;
+        const float cy = m_caretTrail.to.y + m_caretTrail.to.height * .5F;
+        x1 = cx + std::cos(a * tau) * radius; y1 = cy + std::sin(a * tau) * radius;
+        x2 = cx + std::cos(b * tau) * radius; y2 = cy + std::sin(b * tau) * radius;
+      } else if (m_caretEffect == CaretEffect::Ribbon) {
+        const float wave = m_caretTrail.to.height * .16F * (1.0F - p);
+        y1 += std::sin(a * 6.28318530718F + p * 6.28318530718F) * wave;
+        y2 += std::sin(b * 6.28318530718F + p * 6.28318530718F) * wave;
+      } else {
+        thickness = std::max(thickness, m_caretTrail.to.height * (.08F + .55F * b));
+      }
+      rotation = std::atan2(y2 - y1, x2 - x1);
+      const float length = std::hypot(x2 - x1, y2 - y1);
+      // Position the unrotated segment around its starting center, not its top-left.
+      rect = {x1 + std::sin(rotation) * thickness * .5F,
+              y1 - std::cos(rotation) * thickness * .5F, length + .5F / m_cursorRenderScale, thickness};
+    }
+    stamp->setTransformOrigin(0.0F, 0.0F);
+    stamp->setRotation(rotation);
+    stamp->setPosition(rect.x, rect.y);
+    stamp->setFrameSize(rect.width, rect.height);
+    stamp->setOpacity(m_caretEffect == CaretEffect::Trail
+        ? m_caretTrail.opacity(progress, i, m_caretStrength)
+        : m_caretStrength * (1.0F - std::clamp(progress, 0.0F, 1.0F)));
+    stamp->setVisible(m_caretTrail.active && rect.width > 0.0F && rect.height > 0.0F);
+  }
+}
+
 void Input::updateInteractiveGeometry() {
   if (m_cursor == nullptr || m_selectionRect == nullptr) {
     return;
@@ -1835,8 +2089,18 @@ void Input::updateInteractiveGeometry() {
     const float left = std::clamp(std::round((viewportX + x) * pixelScale) / pixelScale, minX, maxX);
     const float top = std::round((viewportY + y) * pixelScale) / pixelScale;
     const float bottom = std::round((viewportY + y + height) * pixelScale) / pixelScale;
-    m_cursor->setPosition(left - viewportX, top - viewportY);
-    m_cursor->setFrameSize(cursorWidth, std::max(1.0F / pixelScale, bottom - top));
+    m_caretInsertionRect = {left - viewportX, top - viewportY, cursorWidth,
+                           std::max(1.0F / pixelScale, bottom - top)};
+    float cellX = x, cellWidth = cursorWidth;
+    const auto& cells = m_caretCells.empty() ? m_stopRect : m_caretCells;
+    if (m_caretShape != CaretShape::Line && cells.size() == m_stopByte.size() && !cells.empty()) {
+      const auto& cell = cells[stopIndexForByte(m_cursorPos)];
+      if (cell.cellWidth > 0.0F) {
+        cellX += cell.cellX - cell.x;
+        cellWidth = cell.cellWidth;
+      }
+    }
+    updateCaretPaint(cellX, cellWidth);
   };
   updateCursorVisibility();
 
@@ -2000,6 +2264,10 @@ float Input::currentLineHeight() const noexcept {
   return std::max(1.0F, m_fontSize * 1.4F);
 }
 
+float Input::measuredMultilineHeight() const noexcept {
+  return (m_value.empty() ? currentLineHeight() : contentTextHeight()) + kMultilinePadV * 2.0F;
+}
+
 void Input::ensureCursorVisibleY() {
   if (!multilineStopsValid()) {
     m_scrollOffsetY = 0.0F;
@@ -2057,6 +2325,10 @@ LayoutSize Input::doMeasure(Renderer& renderer, const LayoutConstraints& constra
     assignH = constraints.maxHeight;
   }
   setSize(assignW, assignH);
+  if (m_multiline && m_stopsBuiltForWidth != textViewportWidth()) {
+    m_textMetricsDirty = true;
+    m_revealCursorYPending = true;
+  }
   if (m_textMetricsDirty || m_stopByte.empty()) {
     rebuildCursorStops(renderer);
   }
@@ -2065,9 +2337,13 @@ LayoutSize Input::doMeasure(Renderer& renderer, const LayoutConstraints& constra
 }
 
 void Input::updateCursorVisibility() {
-  const bool focused = m_inputArea != nullptr && m_inputArea->focused();
+  const bool eligible = caretPaintEligible();
   const bool blinkVisible = !MotionService::instance().enabled() || m_cursorBlinkVisible;
-  m_cursor->setVisible(focused && !hasSelection() && !m_preeditCaretHidden && blinkVisible);
+  m_cursor->setVisible(eligible && blinkVisible);
+  if (m_caretText.clip != nullptr)
+    m_caretText.clip->setVisible(m_cursor->visible() && m_caretShape == CaretShape::Box &&
+                                !m_value.empty() && !passwordMasked() && !m_textMetricsDirty);
+  if (!eligible || !MotionService::instance().enabled()) resetCaretEffects();
 }
 
 void Input::revealCursor() {

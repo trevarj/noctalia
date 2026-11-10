@@ -629,7 +629,7 @@ void CairoTextRenderer::measureCursorStops(
 
 void CairoTextRenderer::measureCursorStopsWrapped(
     float contentScale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,
-    float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font
+    float maxWidth, std::vector<TextCursorStop>& outStops, const TextFont& font, bool includeCells
 ) {
   maybeSyncFontConfig();
   outStops.clear();
@@ -639,7 +639,7 @@ void CairoTextRenderer::measureCursorStopsWrapped(
     return;
   }
   const float fallbackHeight = fontSize > 0.0F ? fontSize : 1.0F;
-  if (m_pangoContext == nullptr || text.empty()) {
+  if (m_pangoContext == nullptr || (text.empty() && !includeCells)) {
     outStops.resize(byteOffsets.size(), TextCursorStop{0.0F, 0.0F, fallbackHeight});
     return;
   }
@@ -649,6 +649,9 @@ void CairoTextRenderer::measureCursorStopsWrapped(
   PangoLayout* layout = buildLayout(contentScale, text, fontSize, font, maxWidth * contentScale, 0, TextAlign::Start);
   const float invScale = 1.0F / contentScale;
   const float pscale = 1.0F / static_cast<float>(PANGO_SCALE);
+  // Reuse native font/size/features/DPR-keyed metrics; no extra space layout on every edit.
+  // End-of-line/empty slots use the font's real advance, not an em/monospace guess.
+  const float spaceWidth = includeCells ? measure(contentScale, " ", fontSize, font).width : 0.0F;
   for (const std::size_t offset : byteOffsets) {
     const std::size_t clampedOffset = std::min(offset, text.size());
     const int index = clampedOffset > static_cast<std::size_t>(std::numeric_limits<int>::max())
@@ -664,6 +667,28 @@ void CairoTextRenderer::measureCursorStopsWrapped(
             static_cast<float>(strong.height) * pscale * invScale,
         }
     );
+    if (includeCells) {
+      PangoRectangle cell{};
+      // Pango normalizes internal combining/ZWJ positions to their grapheme boundaries.
+      // Negative width is the actual RTL advance, including at a bidi run boundary.
+      pango_layout_index_to_pos(layout, index, &cell);
+      auto& stop = outStops.back();
+      const float x0 = static_cast<float>(cell.x) * pscale * invScale;
+      const float x1 = static_cast<float>(cell.x + cell.width) * pscale * invScale;
+      stop.cellX = std::min(x0, x1);
+      stop.cellWidth = std::abs(x1 - x0);
+      if (stop.cellWidth <= 0.0F) {
+        stop.cellWidth = spaceWidth;
+        stop.cellX = stop.x;
+        // A paragraph's end index has no character run; its strong insertion edge
+        // follows the resolved line direction, not Pango's LTR run fallback.
+        int lineIndex = 0;
+        pango_layout_index_to_line_x(layout, index, false, &lineIndex, nullptr);
+        auto* line = pango_layout_get_line_readonly(layout, lineIndex);
+        if (line != nullptr && pango_layout_line_get_resolved_direction(line) == PANGO_DIRECTION_RTL)
+          stop.cellX -= spaceWidth;
+      }
+    }
   }
 
   g_object_unref(layout);

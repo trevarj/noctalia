@@ -262,9 +262,9 @@ void RenderContext::measureTextCursorStopsScaled(
 
 void RenderContext::measureTextCursorStopsWrappedScaled(
     float scale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-    std::vector<TextCursorStop>& outStops, const TextFont& font
+    std::vector<TextCursorStop>& outStops, const TextFont& font, bool includeCells
 ) {
-  m_textRenderer.measureCursorStopsWrapped(scale, text, fontSize, byteOffsets, maxWidth, outStops, font);
+  m_textRenderer.measureCursorStopsWrapped(scale, text, fontSize, byteOffsets, maxWidth, outStops, font, includeCells);
 }
 
 void RenderContext::measureTextCharSpansScaled(

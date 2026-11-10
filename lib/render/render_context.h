@@ -70,7 +70,7 @@ private:
   );
   void measureTextCursorStopsWrappedScaled(
       float scale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
-      std::vector<TextCursorStop>& outStops, const TextFont& font
+      std::vector<TextCursorStop>& outStops, const TextFont& font, bool includeCells = false
   );
   void measureTextCharSpansScaled(
       float scale, std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets,

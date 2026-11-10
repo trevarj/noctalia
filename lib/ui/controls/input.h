@@ -3,11 +3,14 @@
 #include "core/timer_manager.h"
 #include "render/core/renderer.h"
 #include "render/scene/node.h"
+#include "render/scene/input_area.h"
+#include "ui/controls/input_caret.h"
 #include "ui/palette.h"
 #include "ui/signal.h"
 #include "ui/style.h"
 #include "ui/text_input_client.h"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +23,6 @@
 
 class TextClipboard;
 class GlyphNode;
-class InputArea;
 class Label;
 class RectNode;
 
@@ -33,6 +35,16 @@ public:
 
   Input();
   ~Input() override;
+
+  enum class CaretShape : std::uint8_t { Line = 0, Box = 1, Underline = 2 };
+  enum class CaretEffect : std::uint8_t { Off = 0, Trail = 1, Comet = 2, Ribbon = 3, Pulse = 4 };
+  // Box fills the native grapheme cell and repaints its shaped glyph in a contrasting color.
+  void setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs = 120.0F, float strength = 0.20F);
+  // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
+  void resetCaretEffects();
+  void setAnimationManager(AnimationManager* manager) override;
+  // Native wrapped content height from the latest measure/layout, including viewport padding.
+  float measuredMultilineHeight() const noexcept;
 
   struct EditSnapshot {
     std::string value;
@@ -55,7 +67,8 @@ public:
   EditingState editingState() const;
   // Committed composition state can change while displayed text/caret remain identical.
   bool editingStateMatches(const EditingState& state) const noexcept;
-  void restoreEditingState(const EditingState& state);
+  // Same-document peers can restore shared text/history while retaining their own viewport.
+  void restoreEditingState(const EditingState& state, bool preserveScroll = false);
   bool insertText(std::string_view text);
   std::size_t cursorPosition() const noexcept { return m_cursorPos; }
   std::size_t selectionAnchor() const noexcept { return m_selectionAnchor; }
@@ -93,6 +106,8 @@ public:
   void setOnChange(std::function<void(const std::string&)> callback);
   void setOnSubmit(std::function<void(const std::string&)> callback);
   void setOnKeyEvent(std::function<bool(std::uint32_t sym, std::uint32_t modifiers)> callback);
+  // Pointer invocation preserves selection/composition; nullptr denotes Menu or Shift+F10.
+  void setOnContextMenu(std::function<void(const InputArea::PointerData*)> callback);
   void setOnFocusLoss(std::function<void()> callback);
   void setOnFocusGain(std::function<void()> callback);
   void setSubmitOnFocusLoss(bool enabled);
@@ -150,6 +165,11 @@ private:
   void updateDisplayText();
   void requestCaretUpdate();
   void updateInteractiveGeometry();
+  bool caretPaintEligible() const;
+  LayoutRect caretViewport() const;
+  void updateCaretPaint(float cellX, float cellWidth);
+  void paintCaretTrail(float progress);
+  void applyCaretStyle(Color color);
   void clearFromButton();
   void updateCursorVisibility();
   void revealCursor();
@@ -263,11 +283,23 @@ private:
   float m_multilineLabelX = 0.0F;
   std::vector<GlyphNode*> m_passwordGlyphs;
   std::vector<RectNode*> m_selectionLineRects;
-  struct SelectionText { Node* clip; Label* label; };
+  struct SelectionText { Node* clip = nullptr; Label* label = nullptr; };
   std::vector<SelectionText> m_selectionText;
+  SelectionText m_caretText;
   std::optional<Color> m_foreground, m_selectionBackground, m_selectionForeground, m_caretColor;
   float m_cursorRenderScale = 1.0F;
-  void updateSelectionText(Renderer& renderer);
+  LayoutRect m_caretInsertionRect;
+  CaretShape m_caretShape = CaretShape::Line;
+  CaretEffect m_caretEffect = CaretEffect::Off;
+  float m_caretDuration = 120.0F, m_caretStrength = 0.20F;
+  std::vector<TextCursorStop> m_caretCells;
+  std::array<RectNode*, input_caret::Trail::count> m_caretStamps{};
+  input_caret::Trail m_caretTrail;
+  std::uint32_t m_caretAnimation = 0;
+  LayoutRect m_caretTrailViewport;
+  float m_caretTrailScale = 1.0F, m_caretTrailScrollX = 0.0F, m_caretTrailScrollY = 0.0F;
+  void updateClippedText(Renderer& renderer, RectNode* rect, SelectionText& item, Color color);
+  void updateTextOverlays(Renderer& renderer);
   float m_scrollOffset = 0.0F;
   float m_scrollOffsetY = 0.0F;
   // Multiline: the caret moved or the text changed since the last layout, so
@@ -283,6 +315,7 @@ private:
   std::function<bool(std::string_view, std::string_view, bool)> m_editValidator;
   std::function<void(const std::string&)> m_onSubmit;
   std::function<bool(std::uint32_t, std::uint32_t)> m_onKeyEvent;
+  std::function<void(const InputArea::PointerData*)> m_onContextMenu;
   std::function<void()> m_onFocusLoss;
   std::function<void()> m_onFocusGain;
   bool m_submitOnFocusLoss = false;
@@ -310,6 +343,7 @@ private:
   float m_lastPrimaryPressX = 0.0F;
   float m_lastPrimaryPressY = 0.0F;
   bool m_hasLastPrimaryPress = false;
+  bool m_primaryPointerSelecting = false;
   // 1 = caret/char drag, 2 = word, 3 = line (resets outside the multi-click window).
   int m_primaryClickCount = 0;
   enum class PointerSelectGranularity : std::uint8_t { Character, Word, Line };

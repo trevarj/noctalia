@@ -49,6 +49,9 @@ struct TextCursorStop {
   float x = 0.0F;
   float y = 0.0F;
   float height = 0.0F;
+  // Optional native grapheme cell; zero width means the backend has no cell geometry.
+  float cellX = 0.0F;
+  float cellWidth = 0.0F;
 };
 
 struct TextCharSpan {
@@ -110,6 +113,14 @@ public:
       std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
       std::vector<TextCursorStop>& outStops, const TextFont& font = {}
   ) = 0;
+  // Same coordinates as wrapped stops, with grapheme cells for block/underline carets.
+  // Kept separate so ordinary line carets do not pay for extra shaping queries.
+  virtual void measureTextCaretStops(
+      std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
+      std::vector<TextCursorStop>& outStops, const TextFont& font = {}
+  ) {
+    measureTextCursorStopsWrapped(text, fontSize, byteOffsets, maxWidth, outStops, font);
+  }
   // Horizontal extent of each character on screen: span i covers the bytes from byteOffsets[i] to
   // byteOffsets[i + 1], laid out on one line like measureTextCursorStops. Right-to-left runs put the
   // spans out of byte order. Leaves outSpans empty when the renderer cannot shape text.
