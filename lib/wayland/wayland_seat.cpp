@@ -86,6 +86,18 @@ void WaylandSeat::setKeyboardEventCallback(KeyboardEventCallback callback) {
   m_keyboardEventCallback = std::move(callback);
 }
 
+bool WaylandSeat::setKeyboardComposeEnabled(bool enabled) {
+  if (!enabled && m_composeState != nullptr &&
+      xkb_compose_state_get_status(m_composeState) == XKB_COMPOSE_COMPOSING) {
+    return false;
+  }
+  if (m_composeState != nullptr) {
+    xkb_compose_state_reset(m_composeState);
+  }
+  m_keyboardComposeEnabled = enabled;
+  return true;
+}
+
 void WaylandSeat::setKeyboardFocusCallback(KeyboardFocusCallback callback) {
   m_keyboardFocusCallback = std::move(callback);
 }
@@ -471,10 +483,8 @@ void WaylandSeat::handleTouchDown(
   }
   self->m_activeTouchId = id;
   self->m_touchSurface = surface;
-  self->m_lastPointerSurface = surface;
-  self->m_lastPointerX = wl_fixed_to_double(x);
-  self->m_lastPointerY = wl_fixed_to_double(y);
-  self->m_hasPointerPosition = true;
+  self->m_touchX = wl_fixed_to_double(x);
+  self->m_touchY = wl_fixed_to_double(y);
   self->m_lastSerial = serial;
   self->m_lastInputSource = InputSource::Touch;
   self->m_pendingTouchEvents.push_back(
@@ -482,8 +492,8 @@ void WaylandSeat::handleTouchDown(
           .type = PointerEvent::Type::Enter,
           .serial = serial,
           .surface = surface,
-          .sx = self->m_lastPointerX,
-          .sy = self->m_lastPointerY,
+          .sx = self->m_touchX,
+          .sy = self->m_touchY,
           .time = time,
           .touch = true,
       }
@@ -493,8 +503,8 @@ void WaylandSeat::handleTouchDown(
           .type = PointerEvent::Type::Button,
           .serial = serial,
           .surface = surface,
-          .sx = self->m_lastPointerX,
-          .sy = self->m_lastPointerY,
+          .sx = self->m_touchX,
+          .sy = self->m_touchY,
           .time = time,
           .button = BTN_LEFT,
           .pressed = true,
@@ -517,8 +527,8 @@ void WaylandSeat::handleTouchUp(
           .type = PointerEvent::Type::Button,
           .serial = serial,
           .surface = surface,
-          .sx = self->m_lastPointerX,
-          .sy = self->m_lastPointerY,
+          .sx = self->m_touchX,
+          .sy = self->m_touchY,
           .time = time,
           .button = BTN_LEFT,
           .pressed = false,
@@ -535,8 +545,6 @@ void WaylandSeat::handleTouchUp(
   );
   self->m_activeTouchId = -1;
   self->m_touchSurface = nullptr;
-  self->m_lastPointerSurface = nullptr;
-  self->m_hasPointerPosition = false;
 }
 
 void WaylandSeat::handleTouchMotion(
@@ -546,14 +554,14 @@ void WaylandSeat::handleTouchMotion(
   if (id != self->m_activeTouchId) {
     return;
   }
-  self->m_lastPointerX = wl_fixed_to_double(x);
-  self->m_lastPointerY = wl_fixed_to_double(y);
+  self->m_touchX = wl_fixed_to_double(x);
+  self->m_touchY = wl_fixed_to_double(y);
   self->m_pendingTouchEvents.push_back(
       PointerEvent{
           .type = PointerEvent::Type::Motion,
           .surface = self->m_touchSurface,
-          .sx = self->m_lastPointerX,
-          .sy = self->m_lastPointerY,
+          .sx = self->m_touchX,
+          .sy = self->m_touchY,
           .time = time,
           .touch = true,
       }
@@ -593,8 +601,6 @@ void WaylandSeat::handleTouchCancel(void* data, wl_touch* /*touch*/) {
   auto* surface = self->m_touchSurface;
   self->m_activeTouchId = -1;
   self->m_touchSurface = nullptr;
-  self->m_lastPointerSurface = nullptr;
-  self->m_hasPointerPosition = false;
   self->m_pendingTouchEvents.clear();
 
   if (self->m_pointerEventCallback) {
@@ -722,7 +728,7 @@ void WaylandSeat::handleKeyboardKey(
   const bool pressed = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
 
   // Feed through compose state for dead key / intl layout support
-  if (pressed && self->m_composeState != nullptr) {
+  if (pressed && self->m_keyboardComposeEnabled && self->m_composeState != nullptr) {
     xkb_compose_state_feed(self->m_composeState, static_cast<xkb_keysym_t>(sym));
     const auto status = xkb_compose_state_get_status(self->m_composeState);
     if (status == XKB_COMPOSE_COMPOSED) {

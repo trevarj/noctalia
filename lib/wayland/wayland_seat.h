@@ -82,6 +82,8 @@ public:
   void setCursorShapeManager(wp_cursor_shape_manager_v1* manager);
   void setPointerEventCallback(PointerEventCallback callback);
   void setKeyboardEventCallback(KeyboardEventCallback callback);
+  // Successful calls reset compose state; disabling an active sequence leaves it unchanged and returns false.
+  bool setKeyboardComposeEnabled(bool enabled);
   void setKeyboardFocusCallback(KeyboardFocusCallback callback);
   void setKeyboardModifiersCallback(KeyboardModifiersCallback callback);
   void setLockKeysChangeCallback(LockKeysChangeCallback callback);
@@ -199,6 +201,8 @@ private:
   wl_touch* m_touch = nullptr;
   std::int32_t m_activeTouchId = -1;
   wl_surface* m_touchSurface = nullptr;
+  double m_touchX = 0.0;
+  double m_touchY = 0.0;
   std::vector<PointerEvent> m_pendingTouchEvents;
 
   wl_seat* m_seat = nullptr;
@@ -213,6 +217,7 @@ private:
   std::string m_xkbKeymapData;
   xkb_compose_table* m_composeTable = nullptr;
   xkb_compose_state* m_composeState = nullptr;
+  bool m_keyboardComposeEnabled = true;
   KeyboardEventCallback m_keyboardEventCallback;
   KeyboardFocusCallback m_keyboardFocusCallback;
   KeyboardModifiersCallback m_keyboardModifiersCallback;

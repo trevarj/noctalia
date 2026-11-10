@@ -758,6 +758,10 @@ void WaylandConnection::setKeyboardEventCallback(WaylandSeat::KeyboardEventCallb
   m_seatHandler.setKeyboardEventCallback(std::move(callback));
 }
 
+bool WaylandConnection::setKeyboardComposeEnabled(bool enabled) {
+  return m_seatHandler.setKeyboardComposeEnabled(enabled);
+}
+
 void WaylandConnection::setKeyboardModifiersCallback(WaylandSeat::KeyboardModifiersCallback callback) {
   m_seatHandler.setKeyboardModifiersCallback(std::move(callback));
 }
