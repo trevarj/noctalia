@@ -25,6 +25,7 @@ class TextClipboard;
 class GlyphNode;
 class Label;
 class RectNode;
+class TextNode;
 
 class Input : public Node, public TextInputClient {
 public:
@@ -107,6 +108,9 @@ public:
                      std::optional<Color> selectionForeground, std::optional<Color> caret);
   void setValue(std::string_view value);
   void setPlaceholder(std::string_view placeholder);
+  // Paint-only suffix at the shaped end caret; never part of the document or projection.
+  // Hidden while unfocused, selected, composing, password-masked, or away from the end.
+  void setInlineGhost(std::string text);
   void setFontSize(float size);
   void setControlHeight(float height);
   void setHorizontalPadding(float padding);
@@ -202,6 +206,7 @@ private:
   void applyCaretStyle(Color color);
   void clearFromButton();
   void updateCursorVisibility();
+  void updateInlineGhost();
   void revealCursor();
   void startCursorBlink();
   void stopCursorBlink();
@@ -281,6 +286,7 @@ private:
   RectNode* m_selectionRect = nullptr;
   Label* m_label = nullptr;
   RectNode* m_cursor = nullptr;
+  TextNode* m_inlineGhost = nullptr;
   InputArea* m_inputArea = nullptr;
   InputArea* m_clearButtonArea = nullptr;
   GlyphNode* m_clearButtonGlyph = nullptr;

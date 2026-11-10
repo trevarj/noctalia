@@ -15,6 +15,7 @@
 #include "render/scene/glyph_node.h"
 #include "render/scene/input_area.h"
 #include "render/scene/rect_node.h"
+#include "render/scene/text_node.h"
 #include "render/text/glyph_registry.h"
 #include "ui/controls/label.h"
 #include "ui/palette.h"
@@ -188,6 +189,13 @@ Input::Input() {
   cursor->setZIndex(1);
   cursor->setHitTestVisible(false);
   m_cursor = static_cast<RectNode*>(m_textViewport->addChild(std::move(cursor)));
+
+  auto ghost = std::make_unique<TextNode>();
+  ghost->setParticipatesInLayout(false);
+  ghost->setHitTestVisible(false);
+  ghost->setMaxLines(1);
+  ghost->setVisible(false);
+  m_inlineGhost = static_cast<TextNode*>(m_textViewport->addChild(std::move(ghost)));
 
   // Full-field input area.
   auto area = std::make_unique<InputArea>();
@@ -738,6 +746,13 @@ bool Input::insertText(std::string_view text) {
   notifyTextInputStateChanged(TextInputChangeCause::Other);
   if (m_onChange) m_onChange(m_value);
   return true;
+}
+
+void Input::setInlineGhost(std::string text) {
+  if (m_inlineGhost->text() == text) return;
+  m_inlineGhost->setText(std::move(text));
+  updateInlineGhost();
+  markPaintDirty();
 }
 
 void Input::setPlaceholder(std::string_view placeholder) {
@@ -2026,6 +2041,7 @@ void Input::applyVisualState() {
     if (m_clearButtonGlyph != nullptr) {
       m_clearButtonGlyph->setColor(resolved(ColorRole::OnPrimary, clearButtonHovered ? 1.0F : 0.72F));
     }
+    updateInlineGhost();
     return;
   }
 
@@ -2057,6 +2073,7 @@ void Input::applyVisualState() {
   if (m_clearButtonGlyph != nullptr) {
     m_clearButtonGlyph->setColor(resolved(clearButtonHovered ? ColorRole::OnSurface : ColorRole::OnSurfaceVariant));
   }
+  updateInlineGhost();
 }
 
 void Input::updateDisplayText() {
@@ -2301,6 +2318,7 @@ void Input::updateInteractiveGeometry() {
       }
     }
     updateCaretPaint(cellX, cellWidth);
+    updateInlineGhost();
   };
   updateCursorVisibility();
 
@@ -2541,6 +2559,31 @@ LayoutSize Input::doMeasure(Renderer& renderer, const LayoutConstraints& constra
   return constraints.constrain(LayoutSize{.width = w, .height = assignH});
 }
 
+void Input::updateInlineGhost() {
+  if (m_inlineGhost == nullptr) return;
+  const bool show = !m_inlineGhost->text().empty() && caretPaintEligible() &&
+                    !composing() && !m_passwordMode && m_cursorPos == m_value.size() &&
+                    !m_textMetricsDirty;
+  m_inlineGhost->setVisible(show);
+  if (!show) return;
+  m_inlineGhost->setFontSize(m_fontSize);
+  if (m_inlineGhost->fontFamily() != m_label->font().family)
+    m_inlineGhost->setFontFamily(m_label->font().family);
+  if (m_inlineGhost->fontFeatures() != m_label->font().features)
+    m_inlineGhost->setFontFeatures(m_label->font().features);
+  m_inlineGhost->setFontWeight(m_label->font().weight);
+  Color color = m_foreground.value_or(resolved(
+      m_embeddedOnSolidPrimary && !m_frameVisible ? ColorRole::OnPrimary : ColorRole::OnSurface));
+  color.a *= 0.4F;
+  m_inlineGhost->setColor(color);
+  const auto& stops = m_multiline ? m_stopRect : m_caretCells;
+  const auto index = stopIndexForByte(m_cursorPos);
+  const float lineY = index < stops.size() ? stops[index].lineY : 0.0F;
+  const float x = m_multiline && index < stops.size() ? stops[index].x
+      : stopXForByte(m_cursorPos) - m_scrollOffset + m_contentLeadSlack;
+  m_inlineGhost->setPosition(x, m_label->y() + m_label->baselineOffset() + lineY);
+}
+
 void Input::updateCursorVisibility() {
   const bool eligible = caretPaintEligible();
   const bool blinkVisible = !MotionService::instance().enabled() || m_cursorBlinkVisible;
@@ -2549,6 +2592,7 @@ void Input::updateCursorVisibility() {
     m_caretText.clip->setVisible(m_cursor->visible() && m_caretShape == CaretShape::Box &&
                                 !m_value.empty() && !passwordMasked() && !m_textMetricsDirty);
   if (!eligible || !MotionService::instance().enabled()) resetCaretEffects();
+  updateInlineGhost();
 }
 
 void Input::revealCursor() {
