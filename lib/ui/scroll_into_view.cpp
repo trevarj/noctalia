@@ -11,7 +11,7 @@ void scrollNodeIntoScrollView(ScrollView& scrollView, ScrollViewState* state, co
     return;
   }
 
-  const float viewportHeight = std::max(0.0F, scrollView.height() - scrollView.viewportPaddingV() * 2.0F);
+  const float viewportHeight = scrollView.contentViewportHeight();
   if (viewportHeight <= 0.0F) {
     return;
   }
