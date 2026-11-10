@@ -9,6 +9,16 @@ project('noctalia', ['c', 'cpp'],
   ],
 )
 
+if get_option('library_only')
+  noctalia_ui_system_wuffs = get_option('system_libraries')
+  subdir('lib')
+  noctalia_ui_license = files('LICENSE')
+  noctalia_ui_tabler_license = files('lib/assets/fonts/tabler-icons-license.txt')
+  noctalia_ui_wuffs_licenses = files('lib/third_party/wuffs/LICENSE-APACHE', 'lib/third_party/wuffs/LICENSE-MIT')
+  noctalia_ui_emoji = files('assets/emoji.json')
+  subdir_done()
+endif
+
 cc  = meson.get_compiler('c')
 cpp = meson.get_compiler('cpp')
 

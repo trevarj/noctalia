@@ -12,3 +12,9 @@ option(
   value: false,
   description: 'Link system Wuffs, Luau, fzy, and Material Color Utilities instead of the vendored copies in third_party/',
 )
+option(
+  'library_only',
+  type: 'boolean',
+  value: false,
+  description: 'Build only the shared UI library and codecs, without the shell',
+)

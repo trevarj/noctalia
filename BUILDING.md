@@ -137,6 +137,15 @@ The sources are built as C++23, which requires GCC 13+ or Clang 16+. Current rol
 
 Requires [just](https://github.com/casey/just) and [meson](https://mesonbuild.com/).
 
+To consume only the shared UI library and codecs, configure with `-Dlibrary_only=true`
+(or pass `library_only=true` in a Meson subproject's `default_options`). This skips
+shell dependencies and exports the existing `noctalia_ui_dep`,
+`noctalia_ui_codecs_dep`, and `noctalia_ui_assets_dir` from `lib/meson.build`.
+The default remains the full shell build; library consumers install their own assets.
+It also exports `noctalia_ui_license`, `noctalia_ui_tabler_license`,
+`noctalia_ui_wuffs_licenses`, and `noctalia_ui_emoji` as Meson File objects so
+consumers can install notices and emoji data into their own destinations.
+
 ### Release build
 
 ```sh
