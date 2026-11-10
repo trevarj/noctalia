@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,6 +34,39 @@ public:
   Input();
   ~Input() override;
 
+  struct EditSnapshot {
+    std::string value;
+    std::size_t cursorPos = 0;
+    std::size_t selectionAnchor = 0;
+    bool operator==(const EditSnapshot&) const = default;
+  };
+  struct EditHistory {
+    std::vector<EditSnapshot> undo, redo;
+  };
+  // History is shared, not copied, when a document is displayed in multiple panes.
+  struct EditingState {
+    EditSnapshot current;
+    std::optional<EditSnapshot> preeditBase;
+    std::size_t preeditStart = 0, preeditLength = 0;
+    std::shared_ptr<EditHistory> history = std::make_shared<EditHistory>();
+    float scrollX = 0.0F, scrollY = 0.0F;
+    bool preeditCaretHidden = false;
+  };
+  EditingState editingState() const;
+  // Committed composition state can change while displayed text/caret remain identical.
+  bool editingStateMatches(const EditingState& state) const noexcept;
+  void restoreEditingState(const EditingState& state);
+  bool insertText(std::string_view text);
+  std::size_t cursorPosition() const noexcept { return m_cursorPos; }
+  std::size_t selectionAnchor() const noexcept { return m_selectionAnchor; }
+  bool composing() const noexcept { return m_preeditBase.has_value(); }
+  void setOnEditingStateChanged(std::function<void()> callback);
+  // Runs before keyboard, clipboard, or IME insertion. Rejection changes no text/history.
+  void setEditValidator(std::function<bool(std::string_view, std::string_view, bool)> validator);
+  void setFontFamily(std::string family);
+  void setFontFeatures(std::string features);
+  void setTextColors(std::optional<Color> foreground, std::optional<Color> selectionBackground,
+                     std::optional<Color> selectionForeground, std::optional<Color> caret);
   void setValue(std::string_view value);
   void setPlaceholder(std::string_view placeholder);
   void setFontSize(float size);
@@ -70,6 +104,7 @@ public:
   /// Unfocused frame fill. Fields on a SurfaceContainer card use Surface so they stand out; focus always fills with
   /// Surface.
   void setSurfaceRole(ColorRole role);
+  /// Explicit native logical radius, independent of the control height.
   void setFrameRadius(float radius);
   bool enabled() const noexcept { return m_enabled; }
   bool passwordRevealed() const noexcept { return m_passwordRevealed; }
@@ -104,20 +139,13 @@ private:
     Discrete = 2,
   };
 
-  struct EditSnapshot {
-    std::string value;
-    std::size_t cursorPos = 0;
-    std::size_t selectionAnchor = 0;
-
-    bool operator==(const EditSnapshot&) const = default;
-  };
+  bool insertionAllowed(std::string_view text, bool preedit = false) const;
 
   void doLayout(Renderer& renderer) override;
   LayoutSize doMeasure(Renderer& renderer, const LayoutConstraints& constraints) override;
   void handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers, bool preedit = false);
   void notifyTextInputStateChanged(TextInputChangeCause cause);
   bool removePreeditText();
-  bool deleteSurroundingText(std::uint32_t beforeLength, std::uint32_t afterLength);
   void applyVisualState();
   void updateDisplayText();
   void requestCaretUpdate();
@@ -209,8 +237,9 @@ private:
   std::size_t m_selectionAnchor = 0;
   std::size_t m_preeditStart = 0;
   std::size_t m_preeditLen = 0;
-  std::vector<EditSnapshot> m_undoStack;
-  std::vector<EditSnapshot> m_redoStack;
+  std::optional<EditSnapshot> m_preeditBase;
+  bool m_preeditCaretHidden = false;
+  std::shared_ptr<EditHistory> m_editHistory = std::make_shared<EditHistory>();
   EditCoalesceKind m_lastEditCoalesceKind = EditCoalesceKind::None;
   std::chrono::steady_clock::time_point m_lastUndoRecordTime;
   std::size_t m_typingCoalesceCursorPos = 0;
@@ -234,6 +263,11 @@ private:
   float m_multilineLabelX = 0.0F;
   std::vector<GlyphNode*> m_passwordGlyphs;
   std::vector<RectNode*> m_selectionLineRects;
+  struct SelectionText { Node* clip; Label* label; };
+  std::vector<SelectionText> m_selectionText;
+  std::optional<Color> m_foreground, m_selectionBackground, m_selectionForeground, m_caretColor;
+  float m_cursorRenderScale = 1.0F;
+  void updateSelectionText(Renderer& renderer);
   float m_scrollOffset = 0.0F;
   float m_scrollOffsetY = 0.0F;
   // Multiline: the caret moved or the text changed since the last layout, so
@@ -245,6 +279,8 @@ private:
   Timer m_cursorBlinkTimer;
 
   std::function<void(const std::string&)> m_onChange;
+  std::function<void()> m_onEditingStateChanged;
+  std::function<bool(std::string_view, std::string_view, bool)> m_editValidator;
   std::function<void(const std::string&)> m_onSubmit;
   std::function<bool(std::uint32_t, std::uint32_t)> m_onKeyEvent;
   std::function<void()> m_onFocusLoss;
@@ -264,6 +300,7 @@ private:
   ColorRole m_surfaceRole = ColorRole::SurfaceContainer;
   float m_surfaceOpacity = 1.0F;
   float m_frameRadius = Style::radiusMd;
+  bool m_frameRadiusExplicit = false;
   bool m_enabled = true;
   TextInputService* m_textInputService = nullptr;
   float m_minLayoutWidth = 0.0F;

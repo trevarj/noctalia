@@ -238,7 +238,19 @@ void InputArea::dispatchPress(
     }
   } else {
     const bool releasedInside = containsLocalPoint(localX, localY, true);
-    const bool shouldClick = m_pressed && m_pressedButton == button && releasedInside && m_onClick;
+    bool shouldClick = m_pressed && m_pressedButton == button && releasedInside && m_onClick;
+    if (shouldClick) {
+      float releaseSceneX = 0.0F;
+      float releaseSceneY = 0.0F;
+      Node::mapToScene(this, localX, localY, releaseSceneX, releaseSceneY);
+      // Clips qualify clicks, never the captured motion/release delivery used by drags.
+      for (const Node* ancestor = parent(); ancestor != nullptr; ancestor = ancestor->parent()) {
+        if (ancestor->clipChildren() && !ancestor->containsScenePoint(releaseSceneX, releaseSceneY)) {
+          shouldClick = false;
+          break;
+        }
+      }
+    }
     m_pressed = false;
     m_pressedButton = 0;
 

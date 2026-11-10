@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -12,6 +13,9 @@ public:
 
   // Most recent plain-text clipboard selection currently known, if any.
   virtual std::optional<std::string> clipboardText() = 0;
+  using TextCallback = std::function<void(std::optional<std::string>)>;
+  // Asynchronous transports override this to wait for the current selection offer.
+  virtual void requestClipboardText(TextCallback callback) { callback(clipboardText()); }
 
   // Replace the system clipboard selection with the given text.
   virtual void setClipboardText(std::string text) = 0;
