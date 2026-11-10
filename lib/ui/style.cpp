@@ -5,6 +5,7 @@
 namespace {
 
   float g_cornerRadiusScale = 1.0F;
+  std::optional<float> g_rectangleCornerRadius;
   bool g_buttonBordersEnabled = true;
   bool g_inputBordersEnabled = true;
   bool g_popupBordersEnabled = true;
@@ -20,6 +21,10 @@ namespace Style {
   float cornerRadiusScale() noexcept { return g_cornerRadiusScale; }
 
   void setCornerRadiusScale(float scale) noexcept { g_cornerRadiusScale = std::clamp(scale, 0.0F, 2.0F); }
+
+  void setRectangleCornerRadius(std::optional<float> radius) noexcept {
+    g_rectangleCornerRadius = radius;
+  }
 
   bool buttonBordersEnabled() noexcept { return g_buttonBordersEnabled; }
 
@@ -69,10 +74,16 @@ namespace Style {
 
   float scaledRadiusSm(float localScale) noexcept { return scaledRadius(radiusSm, localScale); }
 
-  float scaledRadiusMd(float localScale) noexcept { return scaledRadius(radiusMd, localScale); }
+  float scaledRadiusMd(float localScale) noexcept {
+    return g_rectangleCornerRadius ? *g_rectangleCornerRadius : scaledRadius(radiusMd, localScale);
+  }
 
-  float scaledRadiusLg(float localScale) noexcept { return scaledRadius(radiusLg, localScale); }
+  float scaledRadiusLg(float localScale) noexcept {
+    return g_rectangleCornerRadius ? *g_rectangleCornerRadius : scaledRadius(radiusLg, localScale);
+  }
 
-  float scaledRadiusXl(float localScale) noexcept { return scaledRadius(radiusXl, localScale); }
+  float scaledRadiusXl(float localScale) noexcept {
+    return g_rectangleCornerRadius ? *g_rectangleCornerRadius : scaledRadius(radiusXl, localScale);
+  }
 
 } // namespace Style

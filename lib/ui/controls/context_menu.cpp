@@ -286,9 +286,7 @@ void ContextMenuControl::rebuildRows(Renderer& renderer) {
   const float itemGap = kItemGap * scale;
   const std::size_t visibleItems = std::min(m_entries.size(), m_maxVisible);
   const float rowWidth = width() - menuPadding * 2.0F;
-  // Concentric with the container: the highlight is inset by menuPadding, so its
-  // radius tracks the container radius minus that inset at any corner roundness.
-  const float highlightRadius = std::max(0.0F, Style::scaledRadiusLg(scale) - menuPadding);
+  const float highlightRadius = Style::scaledRadiusMd(scale);
   float currentY = menuPadding;
   m_rows.clear();
   m_rows.reserve(visibleItems);

@@ -248,7 +248,7 @@ void ListEditor::addGhostIconButton(Flex& row, std::string_view glyph, float siz
           .minWidth = kItemRowHeight * m_scale,
           .minHeight = kItemRowHeight * m_scale,
           .padding = Style::spaceXs * m_scale,
-          .radius = Style::scaledRadiusSm(m_scale),
+          .radius = Style::scaledRadiusMd(m_scale),
           .onClick = std::move(callback),
       })
   );

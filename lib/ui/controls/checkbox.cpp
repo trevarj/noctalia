@@ -106,7 +106,7 @@ void Checkbox::doLayout(Renderer& renderer) {
   if (m_box != nullptr) {
     m_box->setPosition(boxInset, boxInset);
     m_box->setFrameSize(boxSize, boxSize);
-    m_box->setRadius(Style::scaledRadiusSm(m_scale));
+    m_box->setRadius(Style::scaledRadiusMd(m_scale));
   }
 
   if (m_checkGlyph != nullptr) {

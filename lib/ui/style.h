@@ -2,6 +2,8 @@
 
 #include "ui/signal.h"
 
+#include <optional>
+
 namespace Style {
 
   inline constexpr int barThicknessDefault = 34;
@@ -99,6 +101,9 @@ namespace Style {
 
   float cornerRadiusScale() noexcept;
   void setCornerRadiusScale(float scale) noexcept;
+
+  // Host-supplied native logical radius; nullopt restores each scaled rectangular default.
+  void setRectangleCornerRadius(std::optional<float> radius) noexcept;
 
   bool buttonBordersEnabled() noexcept;
   void setButtonBordersEnabled(bool enabled);
