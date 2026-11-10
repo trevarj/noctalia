@@ -493,15 +493,11 @@ void Button::setSurfaceOpacity(float opacity) {
     return;
   }
   m_surfaceOpacity = clamped;
-  applyVariant();
+  applyVisualState();
 }
 
 void Button::applyVariant() {
   m_palette = m_customPalette.value_or(paletteForVariant(m_variant));
-  if (m_surfaceOpacity < 1.0F) {
-    m_palette.normal.bg.alpha *= m_surfaceOpacity;
-    m_palette.disabled.bg.alpha *= m_surfaceOpacity;
-  }
   setBorder(m_palette.normal.border, effectiveBorderWidth());
 
   // Only seed targets before the first visual state application. Once the
@@ -620,6 +616,12 @@ float Button::effectiveBorderWidth() const noexcept {
 }
 
 void Button::resolveVisualStateColors(Color& targetBg, Color& targetBorder, Color& targetLabel) const {
+  const auto background = [this](const ColorSpec& spec) {
+    Color color = resolveColorSpec(spec);
+    // Surface alpha is the host's background ceiling, not an opacity on the control's children.
+    color.a = std::min(color.a, spec.alpha * palette.surface.a) * m_surfaceOpacity;
+    return color;
+  };
   const bool isKeyboardFocused = m_enabled && m_keyboardFocusHint;
   const bool isInputFocused = m_enabled && m_inputArea != nullptr && m_inputArea->focused();
   const bool keyboardNavFocus = isKeyboardFocused
@@ -634,27 +636,27 @@ void Button::resolveVisualStateColors(Color& targetBg, Color& targetBorder, Colo
   bool isSelected = m_enabled && m_selected;
 
   if (!m_enabled) {
-    targetBg = resolveColorSpec(m_palette.disabled.bg);
+    targetBg = background(m_palette.disabled.bg);
     targetBorder = resolveColorSpec(m_palette.disabled.border);
     targetLabel = resolveColorSpec(m_palette.disabled.label);
   } else if (isPressed) {
-    targetBg = resolveColorSpec(m_palette.pressed.bg);
+    targetBg = background(m_palette.pressed.bg);
     targetBorder = resolveColorSpec(m_palette.pressed.border);
     targetLabel = resolveColorSpec(m_palette.pressed.label);
   } else if (isSelected && m_palette.selected.has_value()) {
-    targetBg = resolveColorSpec(m_palette.selected->bg);
+    targetBg = background(m_palette.selected->bg);
     targetBorder = resolveColorSpec(m_palette.selected->border);
     targetLabel = resolveColorSpec(m_palette.selected->label);
   } else if (keyboardNavFocus) {
-    targetBg = resolveColorSpec(colorSpecFromRole(ColorRole::Secondary));
+    targetBg = background(colorSpecFromRole(ColorRole::Secondary));
     targetBorder = resolveColorSpec(clearColorSpec());
     targetLabel = resolveColorSpec(colorSpecFromRole(ColorRole::OnSecondary));
   } else if (isHovered || isSelected) {
-    targetBg = resolveColorSpec(m_palette.hover.bg);
+    targetBg = background(m_palette.hover.bg);
     targetBorder = resolveColorSpec(m_palette.hover.border);
     targetLabel = resolveColorSpec(m_palette.hover.label);
   } else {
-    targetBg = resolveColorSpec(m_palette.normal.bg);
+    targetBg = background(m_palette.normal.bg);
     targetBorder = resolveColorSpec(m_palette.normal.border);
     targetLabel = resolveColorSpec(m_palette.normal.label);
   }

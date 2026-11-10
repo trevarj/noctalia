@@ -91,6 +91,8 @@ public:
   Label* label() const noexcept { return m_label; }
   Glyph* glyph() const noexcept { return m_glyph; }
   InputArea* inputArea() const noexcept { return m_inputArea; }
+  // Current resolved/animated foreground, including for buttons without a label or glyph.
+  const Color& foregroundColor() const noexcept { return m_displayedLabel; }
   bool hovered() const noexcept;
   bool pressed() const noexcept;
   bool enabled() const noexcept { return m_enabled; }
