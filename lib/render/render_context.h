@@ -8,12 +8,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 class GlSharedContext;
 class Node;
 class RenderBackend;
 class RenderTarget;
+class RenderFramebuffer;
 enum class RenderGraphicsResetStatus;
 struct Mat3;
 struct RenderScissor;
@@ -84,8 +86,23 @@ private:
   void renderNode(
       float renderScale, const Node* node, const Mat3& parentTransform, float parentOpacity, float sw, float sh,
       float bw, float bh, float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip,
-      bool ignoreNodeOpacity, bool parentPaintContained, const RenderScissor* partition = nullptr
+      bool ignoreNodeOpacity, bool parentPaintContained, const RenderScissor* partition = nullptr,
+      bool localBlurSource = false
   );
+
+  struct ForegroundBlurCache {
+    std::unique_ptr<RenderFramebuffer> image;
+    std::unique_ptr<RenderFramebuffer> scratch;
+    std::uint64_t revision = 0;
+    float scale = 0.0F;
+    float width = 0.0F;
+    float height = 0.0F;
+    bool used = false;
+    std::vector<std::pair<const Node*, std::uint64_t>> proxySources;
+  };
+  std::unordered_map<std::uint64_t, ForegroundBlurCache> m_foregroundBlur;
+  RenderFramebuffer* m_activeFramebuffer = nullptr;
+  std::uint64_t m_foregroundBlurFailures = 0;
 
   std::unique_ptr<RenderBackend> m_backend;
   CairoTextRenderer m_textRenderer;

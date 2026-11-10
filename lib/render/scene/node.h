@@ -93,6 +93,9 @@ public:
   float scaleX() const noexcept { return m_scaleX; }
   float scaleY() const noexcept { return m_scaleY; }
   float opacity() const noexcept { return m_opacity; }
+  float foregroundBlurRadius() const noexcept { return m_foregroundBlurRadius; }
+  std::uint64_t renderIdentity() const noexcept { return m_renderIdentity; }
+  std::uint64_t paintRevision() const noexcept { return m_paintRevision; }
   float flexGrow() const noexcept { return m_flexGrow; }
   bool visible() const noexcept { return m_visible; }
   bool participatesInLayout() const noexcept { return m_participatesInLayout; }
@@ -121,6 +124,11 @@ public:
   void setScale(float scaleX, float scaleY);
   void setTransformOrigin(float x, float y);
   void setOpacity(float opacity);
+  // Gaussian-blurs this node and its descendants, clipped to its local bounds.
+  // Zero disables; positive radii are logical pixels (at least one physical tap).
+  // Interaction is unchanged: callers must disable sensitive child actions.
+  // Allocation/size failure hides the subtree, never falls back to sharp paint.
+  void setForegroundBlurRadius(float radius);
   void setFlexGrow(float grow);
   void setVisible(bool visible);
   void setParticipatesInLayout(bool participatesInLayout);
@@ -206,6 +214,9 @@ private:
   float m_transformOriginY = 0.0F;
   bool m_hasTransformOrigin = false;
   float m_opacity = 1.0F;
+  float m_foregroundBlurRadius = 0.0F;
+  const std::uint64_t m_renderIdentity;
+  std::uint64_t m_paintRevision = 1;
   float m_flexGrow = 0.0F;
   bool m_visible = true;
   bool m_participatesInLayout = true;
@@ -244,7 +255,11 @@ public:
     setHitTestVisible(false);
   }
 
-  void setSource(const Node* source) noexcept { m_source = source; }
+  void setSource(const Node* source) {
+    if (m_source == source) return;
+    m_source = source;
+    markPaintDirty();
+  }
   const Node* source() const noexcept { return m_source; }
 
 private:

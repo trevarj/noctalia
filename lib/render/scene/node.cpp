@@ -5,10 +5,13 @@
 #include "render/core/mat3.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <ranges>
 #include <utility>
 
 namespace {
+  std::atomic<std::uint64_t> nextRenderIdentity{1};
 
   Mat3 localTransform(const Node* node) {
     const float cx = node->width() * 0.5F;
@@ -90,7 +93,7 @@ LayoutSize LayoutConstraints::constrain(LayoutSize size) const noexcept {
   return LayoutSize{.width = constrainWidth(size.width), .height = constrainHeight(size.height)};
 }
 
-Node::Node(NodeType type) : m_type(type) {}
+Node::Node(NodeType type) : m_type(type), m_renderIdentity(nextRenderIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 
 Node::~Node() {
   // Ensure any animation still targeting this node is cancelled before the node goes away.
@@ -407,11 +410,26 @@ std::unique_ptr<Node> Node::removeChild(Node* child) {
   return removed;
 }
 
-void Node::markPaintDirty() { propagatePaintDirty(); }
+void Node::setForegroundBlurRadius(float radius) {
+  radius = std::isfinite(radius) ? std::max(0.0F, radius) : 0.0F;
+  if (m_foregroundBlurRadius == radius) {
+    return;
+  }
+  m_foregroundBlurRadius = radius;
+  markPaintDirty();
+}
+
+void Node::markPaintDirty() {
+  // Dirty flags may already be set, or cleared by the host before drawing.
+  for (Node* node = this; node != nullptr; node = node->m_parent) {
+    ++node->m_paintRevision;
+  }
+  propagatePaintDirty();
+}
 
 void Node::markLayoutDirty() {
   propagateLayoutDirty();
-  propagatePaintDirty();
+  markPaintDirty();
 }
 
 void Node::propagatePaintDirty() {

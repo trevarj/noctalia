@@ -101,6 +101,20 @@ namespace {
         * Mat3::scale(node->scaleX(), node->scaleY())
         * Mat3::translation(-cx, -cy);
   }
+  // Proxy sources live outside the captured ownership tree. Record their
+  // revisions when capturing instead of walking the whole subtree on cache hits.
+  void collectProxySources(const Node* node, std::vector<std::pair<const Node*, std::uint64_t>>& sources) {
+    if (node->type() == NodeType::RenderProxy) {
+      const auto* source = static_cast<const RenderProxyNode*>(node)->source();
+      if (source && std::ranges::none_of(sources, [source](const auto& entry) { return entry.first == source; })) {
+        sources.emplace_back(source, source->paintRevision());
+        collectProxySources(source, sources);
+      }
+    }
+    for (const auto& child : node->children()) {
+      collectProxySources(child.get(), sources);
+    }
+  }
 
 } // namespace
 
@@ -140,6 +154,13 @@ void RenderContext::prepareForGraphicsReset() {
   if (m_backend == nullptr) {
     return;
   }
+
+  for (auto& [identity, cache] : m_foregroundBlur) {
+    if (cache.image) cache.image->abandon();
+    if (cache.scratch) cache.scratch->abandon();
+  }
+  m_foregroundBlur.clear();
+  m_activeFramebuffer = nullptr;
 
   m_textRenderer.abandonGlyphTextures();
   m_glyphRenderer.abandonGlyphTextures();
@@ -202,9 +223,14 @@ void RenderContext::renderScene(RenderTarget& target, Node* sceneRoot, Node* ove
   }
 
   if (m_glyphTexturesDirty) {
+    m_foregroundBlur.clear();
     m_textRenderer.invalidateGlyphTextures();
     m_glyphRenderer.invalidateGlyphTextures();
     m_glyphTexturesDirty = false;
+  }
+
+  for (auto& [identity, cache] : m_foregroundBlur) {
+    cache.used = false;
   }
 
   const auto drawStart = std::chrono::steady_clock::now();
@@ -220,6 +246,7 @@ void RenderContext::renderScene(RenderTarget& target, Node* sceneRoot, Node* ove
       }
     }
   }
+  std::erase_if(m_foregroundBlur, [](const auto& entry) { return !entry.second.used; });
   float ms = elapsedSince(drawStart);
   logSlowRenderOperation(
       ms, "scene draw took {:.1F}ms ({}x{} logical, {}x{} buffer)", ms, target.logicalWidth(), target.logicalHeight(),
@@ -332,13 +359,13 @@ void RenderContext::handleGraphicsReset(RenderGraphicsResetStatus status) {
 void RenderContext::renderNode(
     float renderScale, const Node* node, const Mat3& parentTransform, float parentOpacity, float sw, float sh, float bw,
     float bh, float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip, bool ignoreNodeOpacity,
-    bool parentPaintContained, const RenderScissor* partition
+    bool parentPaintContained, const RenderScissor* partition, bool localBlurSource
 ) {
   if (!node->visible()) {
     return;
   }
 
-  const Mat3 worldTransform = parentTransform * nodeLocalTransform(node);
+  const Mat3 worldTransform = localBlurSource ? Mat3::identity() : parentTransform * nodeLocalTransform(node);
   const float effectiveOpacity = ignoreNodeOpacity ? parentOpacity : parentOpacity * node->opacity();
   float boundsLeft = 0.0F;
   float boundsTop = 0.0F;
@@ -371,6 +398,108 @@ void RenderContext::renderNode(
     m_backend->setScissor(scissor);
   } else {
     m_backend->disableScissor();
+  }
+  if (node->foregroundBlurRadius() > 0.0F && !localBlurSource) {
+    // Capture locally, without inherited opacity or clipping; composite once in
+    // the original scene. Never continue into the sharp-source traversal.
+    const float width = node->width(), height = node->height();
+    const float pixelsWide = std::ceil(width * renderScale);
+    const float pixelsHigh = std::ceil(height * renderScale);
+    const int limit = m_backend->maxTextureSize();
+    if (!std::isfinite(pixelsWide) || !std::isfinite(pixelsHigh)
+        || pixelsWide <= 0.0F || pixelsHigh <= 0.0F
+        || limit <= 0 || pixelsWide > static_cast<float>(limit) || pixelsHigh > static_cast<float>(limit)) {
+      ++m_foregroundBlurFailures;
+      return;
+    }
+    auto& cache = m_foregroundBlur[node->renderIdentity()];
+    cache.used = true;
+    const auto w = static_cast<std::uint32_t>(pixelsWide);
+    const auto h = static_cast<std::uint32_t>(pixelsHigh);
+    auto* previousFramebuffer = m_activeFramebuffer;
+    const auto restoreSceneState = [&] {
+      m_activeFramebuffer = previousFramebuffer;
+      if (previousFramebuffer) {
+        m_backend->bindFramebuffer(*previousFramebuffer);
+      } else {
+        m_backend->bindDefaultFramebuffer();
+      }
+      m_backend->setViewport(static_cast<std::uint32_t>(bw), static_cast<std::uint32_t>(bh));
+      m_backend->setBlendMode(RenderBlendMode::PremultipliedAlpha);
+      if (hasClip || partition != nullptr) {
+        auto scissor = hasClip ? scissorForClip(sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom)
+                              : RenderScissor{0, 0, static_cast<std::int32_t>(bw), static_cast<std::int32_t>(bh)};
+        if (partition) scissor = intersectScissors(scissor, *partition);
+        m_backend->setScissor(scissor);
+      } else {
+        m_backend->disableScissor();
+      }
+    };
+    try {
+      if (!cache.image || !cache.scratch || cache.image->width() != w || cache.image->height() != h) {
+        cache.image = m_backend->createFramebuffer(w, h);
+        cache.scratch = m_backend->createFramebuffer(w, h);
+        cache.revision = 0;
+        restoreSceneState();
+      }
+      if (!cache.image || !cache.scratch || !cache.image->valid() || !cache.scratch->valid()) {
+        ++m_foregroundBlurFailures;
+        return;
+      }
+      const bool sourceChanged = cache.revision == node->paintRevision()
+          && std::ranges::any_of(cache.proxySources, [](const auto& entry) {
+               return entry.first->paintRevision() != entry.second;
+             });
+      if (cache.revision != node->paintRevision() || sourceChanged || cache.scale != renderScale
+          || cache.width != width || cache.height != height) {
+        cache.proxySources.clear();
+        collectProxySources(node, cache.proxySources);
+        const auto failuresBeforeCapture = m_foregroundBlurFailures;
+        m_activeFramebuffer = cache.image.get();
+        m_backend->bindFramebuffer(*cache.image);
+        m_backend->setViewport(w, h);
+        m_backend->disableScissor();
+        m_backend->clear(rgba(0.0F, 0.0F, 0.0F, 0.0F));
+        m_backend->setBlendMode(RenderBlendMode::PremultipliedAlpha);
+        renderNode(renderScale, node, Mat3::identity(), 1.0F, width, height, pixelsWide, pixelsHigh,
+                   0.0F, 0.0F, width, height, true, true, false, nullptr, true);
+        m_backend->disableScissor();
+        m_backend->setBlendMode(RenderBlendMode::Disabled);
+        // The native Gaussian shader supports up to forty physical taps.
+        const float radius = std::clamp(node->foregroundBlurRadius() * renderScale, 1.0F, 40.0F);
+        m_backend->bindFramebuffer(*cache.scratch);
+        m_backend->drawFramebufferBlur(cache.image->colorTexture(), w, h, 1.0F, 0.0F, radius);
+        m_backend->bindFramebuffer(*cache.image);
+        m_backend->drawFramebufferBlur(cache.scratch->colorTexture(), w, h, 0.0F, 1.0F, radius);
+        restoreSceneState();
+        // A failed nested capture must be retried, not frozen into this cache.
+        cache.revision = failuresBeforeCapture == m_foregroundBlurFailures ? node->paintRevision() : 0;
+        cache.scale = renderScale;
+        cache.width = width;
+        cache.height = height;
+      }
+      // Glyph RGBA composition accepts premultiplied textures; image composition
+      // would multiply alpha a second time. Framebuffer textures are bottom-up.
+      m_backend->drawGlyph(RenderGlyphDraw{
+          .texture = cache.image->colorTexture(),
+          .surfaceWidth = sw, .surfaceHeight = sh,
+          .width = width, .height = height,
+          .v0 = 1.0F, .v1 = 0.0F,
+          .opacity = effectiveOpacity,
+          .transform = worldTransform,
+      });
+    } catch (const std::exception& error) {
+      // Privacy-sensitive effect: a failed capture must never reveal its source.
+      cache.revision = 0;
+      ++m_foregroundBlurFailures;
+      restoreSceneState();
+      kLog.warn("foreground blur capture failed: {}", error.what());
+    } catch (...) {
+      cache.revision = 0;
+      restoreSceneState();
+      throw;
+    }
+    return;
   }
 
   switch (node->type()) {
@@ -586,6 +715,8 @@ void RenderContext::cleanup() {
     // Need a current context to destroy GL resources, but we may not have a surface.
     m_backend->makeCurrentNoSurface();
   }
+  m_foregroundBlur.clear();
+  m_activeFramebuffer = nullptr;
 
   // Text renderers first — they destroy GL textures and need a current context.
   m_textRenderer.cleanup();
