@@ -38,6 +38,11 @@ struct LayoutRect {
   float height = 0.0F;
 };
 
+// Explicit shared edges for disjoint, axis-aligned child clip partitions.
+struct PixelPartitionClip {
+  float left = 0.0F, top = 0.0F, right = 0.0F, bottom = 0.0F;
+};
+
 struct HitTestOutset {
   float left = 0.0F;
   float top = 0.0F;
@@ -94,6 +99,9 @@ public:
   bool paintDirty() const noexcept { return m_paintDirty; }
   bool layoutDirty() const noexcept { return m_layoutDirty; }
   bool clipChildren() const noexcept { return m_clipChildren; }
+  const PixelPartitionClip* pixelPartitionClip() const noexcept {
+    return m_hasPixelPartitionClip ? &m_pixelPartitionClip : nullptr;
+  }
   bool paintContained() const noexcept { return m_paintContained; }
   bool hitTestVisible() const noexcept { return m_hitTestVisible; }
   HitTestOutset hitTestOutset() const noexcept { return m_hitTestOutset; }
@@ -117,6 +125,11 @@ public:
   void setVisible(bool visible);
   void setParticipatesInLayout(bool participatesInLayout);
   void setClipChildren(bool clipChildren);
+  // Edges are local to this node. Neighbors must share exact edge values and
+  // the same world transform; quantization uses the actual framebuffer at draw time.
+  // Only effective with clipChildren(); ordinary outward clip rounding is unchanged.
+  void setPixelPartitionClip(float left, float top, float right, float bottom);
+  void clearPixelPartitionClip();
   // Promises that every node in this subtree paints within its own bounds (plus a small slack).
   // Lets the renderer skip subtrees entirely outside the active clip.
   void setPaintContained(bool paintContained);
@@ -199,6 +212,8 @@ private:
   bool m_paintDirty = true;
   bool m_layoutDirty = true;
   bool m_clipChildren = false;
+  bool m_hasPixelPartitionClip = false;
+  PixelPartitionClip m_pixelPartitionClip{};
   bool m_paintContained = false;
   bool m_excludeSubtreeFromTabOrder = false;
   bool m_hitTestVisible = true;

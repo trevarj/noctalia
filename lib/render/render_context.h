@@ -16,6 +16,7 @@ class RenderBackend;
 class RenderTarget;
 enum class RenderGraphicsResetStatus;
 struct Mat3;
+struct RenderScissor;
 
 class RenderContext {
 public:
@@ -83,7 +84,7 @@ private:
   void renderNode(
       float renderScale, const Node* node, const Mat3& parentTransform, float parentOpacity, float sw, float sh,
       float bw, float bh, float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip,
-      bool ignoreNodeOpacity, bool parentPaintContained
+      bool ignoreNodeOpacity, bool parentPaintContained, const RenderScissor* partition = nullptr
   );
 
   std::unique_ptr<RenderBackend> m_backend;

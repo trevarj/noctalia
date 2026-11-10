@@ -292,6 +292,24 @@ void Node::setClipChildren(bool clipChildren) {
   markPaintDirty();
 }
 
+void Node::setPixelPartitionClip(float left, float top, float right, float bottom) {
+  if (m_hasPixelPartitionClip && m_pixelPartitionClip.left == left && m_pixelPartitionClip.top == top
+      && m_pixelPartitionClip.right == right && m_pixelPartitionClip.bottom == bottom) {
+    return;
+  }
+  m_hasPixelPartitionClip = true;
+  m_pixelPartitionClip = {left, top, right, bottom};
+  markPaintDirty();
+}
+
+void Node::clearPixelPartitionClip() {
+  if (!m_hasPixelPartitionClip) {
+    return;
+  }
+  m_hasPixelPartitionClip = false;
+  markPaintDirty();
+}
+
 void Node::setPaintContained(bool paintContained) { m_paintContained = paintContained; }
 
 void Node::setHitTestVisible(bool hitTestVisible) { m_hitTestVisible = hitTestVisible; }

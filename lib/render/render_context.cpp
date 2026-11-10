@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <format>
 #include <initializer_list>
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -50,7 +51,8 @@ namespace {
   }
 
   RenderScissor
-  scissorForClip(float sw, float sh, float bw, float bh, float left, float top, float right, float bottom) {
+  scissorForClip(float sw, float sh, float bw, float bh, float left, float top, float right, float bottom,
+                bool partition = false) {
     const float scaleX = sw > 0.0F ? bw / sw : 1.0F;
     const float scaleY = sh > 0.0F ? bh / sh : 1.0F;
     const auto clampX = [bw](std::int32_t value) {
@@ -59,19 +61,35 @@ namespace {
     const auto clampY = [bh](std::int32_t value) {
       return std::clamp(value, std::int32_t{0}, static_cast<std::int32_t>(std::ceil(bh)));
     };
+    const auto partitionEdge = [](float value, float extent) {
+      const double maximum = std::min(
+          static_cast<double>(extent), static_cast<double>(std::numeric_limits<std::int32_t>::max()));
+      return static_cast<std::int32_t>(std::clamp(std::round(static_cast<double>(value)), 0.0, maximum));
+    };
 
     // Round clip edges independently in buffer space. Rounding the size after
     // flooring the origin can drop the final column/row for fractional origins.
-    const std::int32_t x0 = clampX(static_cast<std::int32_t>(std::floor(left * scaleX)));
-    const std::int32_t x1 = clampX(static_cast<std::int32_t>(std::ceil(right * scaleX)));
-    const std::int32_t y0 = clampY(static_cast<std::int32_t>(std::floor((sh - bottom) * scaleY)));
-    const std::int32_t y1 = clampY(static_cast<std::int32_t>(std::ceil((sh - top) * scaleY)));
+    const std::int32_t x0 = partition ? partitionEdge(left * scaleX, bw)
+                                    : clampX(static_cast<std::int32_t>(std::floor(left * scaleX)));
+    const std::int32_t x1 = partition ? partitionEdge(right * scaleX, bw)
+                                    : clampX(static_cast<std::int32_t>(std::ceil(right * scaleX)));
+    const std::int32_t y0 = partition ? partitionEdge((sh - bottom) * scaleY, bh)
+                                    : clampY(static_cast<std::int32_t>(std::floor((sh - bottom) * scaleY)));
+    const std::int32_t y1 = partition ? partitionEdge((sh - top) * scaleY, bh)
+                                    : clampY(static_cast<std::int32_t>(std::ceil((sh - top) * scaleY)));
     return RenderScissor{
         .x = x0,
         .y = y0,
         .width = std::max(std::int32_t{0}, x1 - x0),
         .height = std::max(std::int32_t{0}, y1 - y0),
     };
+  }
+
+  RenderScissor intersectScissors(RenderScissor a, RenderScissor b) {
+    const auto left = std::max(a.x, b.x), bottom = std::max(a.y, b.y);
+    return {.x = left, .y = bottom,
+            .width = std::max(0, std::min(a.x + a.width, b.x + b.width) - left),
+            .height = std::max(0, std::min(a.y + a.height, b.y + b.height) - bottom)};
   }
 
   Mat3 nodeLocalTransform(const Node* node) {
@@ -314,7 +332,7 @@ void RenderContext::handleGraphicsReset(RenderGraphicsResetStatus status) {
 void RenderContext::renderNode(
     float renderScale, const Node* node, const Mat3& parentTransform, float parentOpacity, float sw, float sh, float bw,
     float bh, float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip, bool ignoreNodeOpacity,
-    bool parentPaintContained
+    bool parentPaintContained, const RenderScissor* partition
 ) {
   if (!node->visible()) {
     return;
@@ -341,8 +359,16 @@ void RenderContext::renderNode(
     return;
   }
 
-  if (hasClip) {
-    m_backend->setScissor(scissorForClip(sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom));
+  if (hasClip || partition != nullptr) {
+    auto scissor = hasClip ? scissorForClip(sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom)
+                          : RenderScissor{0, 0, static_cast<std::int32_t>(bw), static_cast<std::int32_t>(bh)};
+    if (partition != nullptr) {
+      scissor = intersectScissors(scissor, *partition);
+    }
+    if (partition != nullptr && (scissor.width <= 0 || scissor.height <= 0)) {
+      return;
+    }
+    m_backend->setScissor(scissor);
   } else {
     m_backend->disableScissor();
   }
@@ -449,7 +475,7 @@ void RenderContext::renderNode(
       const Mat3 sourceParent = worldTransform * Mat3::translation(-source->x(), -source->y());
       renderNode(
           renderScale, source, sourceParent, effectiveOpacity, sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom,
-          hasClip, true, false
+          hasClip, true, false, partition
       );
     }
     return;
@@ -510,6 +536,30 @@ void RenderContext::renderNode(
     childHasClip = true;
   }
 
+  RenderScissor childPartition{};
+  const RenderScissor* childPartitionPtr = partition;
+  if (node->clipChildren() && node->pixelPartitionClip() != nullptr) {
+    const auto& edges = *node->pixelPartitionClip();
+    const Vec2 a = worldTransform.transformPoint(edges.left, edges.top);
+    const Vec2 b = worldTransform.transformPoint(edges.right, edges.bottom);
+    if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(b.x) || !std::isfinite(b.y)) {
+      return;
+    }
+    childPartition = scissorForClip(sw, sh, bw, bh, std::min(a.x, b.x), std::min(a.y, b.y),
+                                   std::max(a.x, b.x), std::max(a.y, b.y), true);
+    if (hasClip) {
+      childPartition = intersectScissors(
+          childPartition, scissorForClip(sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom));
+    }
+    if (partition != nullptr) {
+      childPartition = intersectScissors(childPartition, *partition);
+    }
+    if (childPartition.width <= 0 || childPartition.height <= 0) {
+      return;
+    }
+    childPartitionPtr = &childPartition;
+  }
+
   if (childHasClip && (childClipRight <= childClipLeft || childClipBottom <= childClipTop)) {
     return;
   }
@@ -518,14 +568,14 @@ void RenderContext::renderNode(
     for (const auto& child : children) {
       renderNode(
           renderScale, child.get(), worldTransform, effectiveOpacity, sw, sh, bw, bh, childClipLeft, childClipTop,
-          childClipRight, childClipBottom, childHasClip, false, paintContained
+          childClipRight, childClipBottom, childHasClip, false, paintContained, childPartitionPtr
       );
     }
   } else {
     for (const auto* child : orderedChildren) {
       renderNode(
           renderScale, child, worldTransform, effectiveOpacity, sw, sh, bw, bh, childClipLeft, childClipTop,
-          childClipRight, childClipBottom, childHasClip, false, paintContained
+          childClipRight, childClipBottom, childHasClip, false, paintContained, childPartitionPtr
       );
     }
   }
