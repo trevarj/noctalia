@@ -98,6 +98,9 @@ public:
   // Keyboard / focus
   void setFocusable(bool focusable);
   bool focusable() const noexcept { return m_focusable; }
+  // False preserves current focus for pointer down/up without changing keyboard focus or tab order.
+  void setFocusOnPointerPress(bool focus) noexcept { m_focusOnPointerPress = focus; }
+  bool focusOnPointerPress() const noexcept { return m_focusOnPointerPress; }
   void setTabStop(bool tabStop);
   bool tabStop() const noexcept { return m_tabStop; }
   void setTabFocusKey(std::string key);
@@ -146,6 +149,12 @@ public:
   enum class TouchScrollAxis : std::uint8_t { None, Vertical, Horizontal };
   void setTouchScrollAxis(TouchScrollAxis axis) noexcept { m_touchScrollAxis = axis; }
   TouchScrollAxis touchScrollAxis() const noexcept { return m_touchScrollAxis; }
+
+  // Opt-in on an accepting passive area: touch-down is immediate while an ancestor still claims a pan.
+  // Press/motion/cancel may update state, visuals or focus; actions and structural UI changes belong on click.
+  // Do not opt active press operations (repeat buttons, sliders, etc.) into this policy.
+  void setPassiveTouchPress(bool passive) noexcept { m_passiveTouchPress = passive; }
+  bool passiveTouchPress() const noexcept { return m_passiveTouchPress; }
 
   void setPropagateEvents(bool propagate);
   bool propagateEvents() const noexcept { return m_propagateEvents; }
@@ -224,6 +233,7 @@ private:
   std::uint32_t m_acceptedButtons = buttonMask(BTN_LEFT);
   std::uint32_t m_acceptedScrollDirections = allScrollDirections();
   TouchScrollAxis m_touchScrollAxis = TouchScrollAxis::None;
+  bool m_passiveTouchPress = false;
   bool m_propagateEvents = false;
   bool m_enabled = true;
   HitShape m_hitShape = HitShape::Rect;
@@ -245,6 +255,7 @@ private:
   // gesture can't bank into the next.
   std::chrono::steady_clock::time_point m_lastAxisTime;
   bool m_focusable = false;
+  bool m_focusOnPointerPress = true;
   bool m_tabStop = true;
   std::string m_tabFocusKey;
   bool m_focused = false;

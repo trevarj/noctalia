@@ -36,6 +36,7 @@ public:
   void setHorizontalPadding(float padding);
   void setGlyphSize(float size);
   void setOptionIndicators(std::vector<ColorSpec> colors);
+  void setOptionIcons(std::vector<std::string> icons);
   void setColorSwatchPreviews(std::vector<ColorSwatchPreview> previews);
   void setNotifyOnReselect(bool enabled);
   void setOnSelectionChanged(std::function<void(std::size_t, std::string_view)> callback);
@@ -81,6 +82,7 @@ private:
   float m_horizontalPadding = Style::spaceMd;
   float m_glyphSize = 14.0F;
   std::vector<ColorSpec> m_indicatorColors;
+  std::vector<std::string> m_optionIcons;
   std::vector<ColorSwatchPreview> m_optionSwatchPreviews;
   bool m_notifyOnReselect = false;
   Signal<>::ScopedConnection m_paletteConn;

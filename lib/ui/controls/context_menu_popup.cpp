@@ -41,6 +41,29 @@ ContextMenuPopup::~ContextMenuPopup() {
 
 void ContextMenuPopup::open(ContextMenuPopupRequest request) {
   close();
+  m_alive = std::make_shared<bool>(true);
+  if (!request.menu.empty()) {
+    m_ownedMenu = std::make_shared<const std::vector<ContextMenuEntry>>(std::move(request.menu));
+    m_level = m_ownedMenu.get();
+  } else if (m_parentMenu == nullptr) {
+    m_ownedMenu.reset();
+    m_level = nullptr;
+  }
+  if (m_level != nullptr) {
+    request.entries.clear();
+    request.entries.reserve(m_level->size());
+    for (std::size_t i = 0; i < m_level->size(); ++i) {
+      auto row = static_cast<const ContextMenuControlEntry&>((*m_level)[i]);
+      row.id = static_cast<std::int32_t>(i);
+      row.hasSubmenu = !(*m_level)[i].children.empty();
+      request.entries.push_back(std::move(row));
+    }
+  }
+  auto rows = std::move(request.entries);
+  m_childRequest = request;
+  request.entries = std::move(rows);
+  m_childRequest.inputSerial = request.inputSerial.value_or(m_wayland.lastInputSerial());
+  m_childRequest.pointerContextMenu = false;
 
   // maxVisible caps the popup viewport; all entries remain reachable via scroll.
   const std::size_t maxVisible =
@@ -94,13 +117,28 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
       .constraintAdjustment = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X
           | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y
           | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X
-          | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y,
+          | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y
+          | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X
+          | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y,
       .offsetX = resolvedPlacement.offsetX,
       .offsetY = resolvedPlacement.offsetY,
       .serial = request.inputSerial.value_or(m_wayland.lastInputSerial()),
       .grab = true,
   };
-  popup_chrome::applyToConfig(popupCfg, chrome, resolvedPlacement.chromeAttachment);
+  if (request.pointerContextMenu) {
+    // Encode each shadow edge in the anchor rectangle, not an offset: XDG flips anchors/gravity,
+    // but does not mirror offsets. Either opening direction then touches the invocation point.
+    popupCfg.anchorX = request.anchor.x - chrome.bleed.left;
+    popupCfg.anchorY = request.anchor.y - chrome.bleed.up;
+    popupCfg.anchorWidth = std::max(1, chrome.bleed.left + chrome.bleed.right);
+    popupCfg.anchorHeight = std::max(1, chrome.bleed.up + chrome.bleed.down);
+    popupCfg.anchor = XDG_POSITIONER_ANCHOR_TOP_LEFT;
+    popupCfg.gravity = XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+    popupCfg.offsetX = 0;
+    popupCfg.offsetY = 0;
+  } else {
+    popup_chrome::applyToConfig(popupCfg, chrome, resolvedPlacement.chromeAttachment);
+  }
 
   m_surface = std::make_unique<PopupSurface>(m_wayland);
   m_surface->setRenderContext(&m_renderContext);
@@ -140,17 +178,31 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
 
     const auto fw = static_cast<float>(width);
     const auto fh = static_cast<float>(height);
+    // The compositor may resize the preferred menu to its available constraint box.
+    auto fittedChrome = chrome;
+    fittedChrome.surfaceWidth = width;
+    fittedChrome.surfaceHeight = height;
+    fittedChrome.bleed.left = std::min(chrome.bleed.left, static_cast<std::int32_t>(width - 1));
+    fittedChrome.bleed.right =
+        std::min(chrome.bleed.right, static_cast<std::int32_t>(width - 1) - fittedChrome.bleed.left);
+    fittedChrome.bleed.up = std::min(chrome.bleed.up, static_cast<std::int32_t>(height - 1));
+    fittedChrome.bleed.down =
+        std::min(chrome.bleed.down, static_cast<std::int32_t>(height - 1) - fittedChrome.bleed.up);
+    fittedChrome.contentWidth = fw - static_cast<float>(fittedChrome.bleed.left + fittedChrome.bleed.right);
+    fittedChrome.contentHeight = fh - static_cast<float>(fittedChrome.bleed.up + fittedChrome.bleed.down);
 
+    self->m_inputDispatcher.setSceneRoot(nullptr);
     self->m_sceneRoot = std::make_unique<Node>();
     self->m_sceneRoot->setSize(fw, fh);
+    self->m_sceneRoot->setClipChildren(true);
     if (Style::popupShadowsEnabled()) {
-      popup_chrome::addShadow(*self->m_sceneRoot, chrome, self->m_shadowConfig, Style::scaledRadiusLg(contentScale));
+      popup_chrome::addShadow(*self->m_sceneRoot, fittedChrome, self->m_shadowConfig, Style::scaledRadiusLg(contentScale));
     }
-    popup_chrome::addCardBackground(*self->m_sceneRoot, chrome, contentScale);
+    popup_chrome::addCardBackground(*self->m_sceneRoot, fittedChrome, contentScale);
 
     auto scrollView = std::make_unique<ScrollView>();
-    scrollView->setPosition(chrome.contentX(), chrome.contentY());
-    scrollView->setSize(chrome.contentWidth, chrome.contentHeight);
+    scrollView->setPosition(fittedChrome.contentX(), fittedChrome.contentY());
+    scrollView->setSize(fittedChrome.contentWidth, fittedChrome.contentHeight);
     scrollView->setContentScale(contentScale);
     scrollView->setViewportPaddingH(0.0F);
     scrollView->setViewportPaddingV(0.0F);
@@ -164,8 +216,8 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
     auto ctrl = std::make_unique<ContextMenuControl>();
     ContextMenuControl* menuPtr = ctrl.get();
     ctrl->setContentScale(contentScale);
-    ctrl->setMenuWidth(chrome.contentWidth);
-    // Lay out every entry; ScrollView clips to maxVisible viewport height.
+    ctrl->setMenuWidth(fittedChrome.contentWidth);
+    // Keep every entry in scroll content, even when the compositor shrinks the viewport.
     ctrl->setMaxVisible(entries.size());
     ctrl->setEntries(entries);
     ctrl->setHighlightedIndex(self->m_highlightedIndex);
@@ -175,6 +227,15 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
         self->m_surface->requestRedraw();
     });
     ctrl->setOnActivate([self](const ContextMenuControlEntry& e) { self->deferActivation(e); });
+    ctrl->setOnSubmenuOpen([self](const ContextMenuControlEntry& entry, float y) {
+      self->openSubmenu(entry, y);
+    });
+    ctrl->setOnHighlightChanged([self](const ContextMenuControlEntry& entry) {
+      if (self->m_child && self->m_childIndex != static_cast<std::size_t>(entry.id)) {
+        self->m_child.reset();
+        self->m_childIndex = static_cast<std::size_t>(-1);
+      }
+    });
     scrollView->content()->addChild(std::move(ctrl));
     ScrollView* scrollPtr = scrollView.get();
     scrollView->layout(self->m_surface->renderTarget().renderer());
@@ -189,6 +250,7 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
       self->m_wayland.setCursorShape(serial, shape);
     });
     self->m_surface->setSceneRoot(self->m_sceneRoot.get());
+    popup_chrome::setContentInputRegion(*self->m_surface, fittedChrome);
   });
 
   m_surface->setDismissedCallback([self] { self->deferClose(); });
@@ -199,28 +261,37 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
     m_releaseParentKeyboard = request.parent.keyboardGrab();
   }
 
+  const auto lifetime = m_alive;
   const bool initialized = request.parent.xdgSurface != nullptr
       ? m_surface->initializeAsChild(request.parent.xdgSurface, request.parent.output, popupCfg)
       : m_surface->initialize(request.parent.attach, request.parent.output, popupCfg);
+  // Native initialization roundtrips may dispatch input that replaces/destroys this level.
+  if (!*lifetime) {
+    return;
+  }
   if (!initialized) {
     kLog.warn("failed to create context menu popup");
-    restoreParentKeyboardInteractivity();
-    m_surface.reset();
+    close();
     return;
   }
 
-  popup_chrome::setContentInputRegion(*m_surface, chrome);
   m_wlSurface = m_surface->wlSurface();
   m_pointerParentSurface = request.pointerParentSurface;
-  s_openMenu = this;
+  s_openMenu = rootMenu();
 }
 
 void ContextMenuPopup::close() {
+  if (m_alive) {
+    *m_alive = false;
+  }
+  m_child.reset();
+  m_childIndex = static_cast<std::size_t>(-1);
   const bool wasOpen = m_surface != nullptr;
   if (s_openMenu == this) {
     s_openMenu = nullptr;
   }
   restoreParentKeyboardInteractivity();
+  m_inputDispatcher.setSceneRoot(nullptr);
   m_menu = nullptr;
   m_scrollView = nullptr;
   m_sceneRoot.reset();
@@ -236,12 +307,14 @@ void ContextMenuPopup::close() {
 bool ContextMenuPopup::isOpen() const noexcept { return m_surface != nullptr; }
 
 void ContextMenuPopup::deferActivation(ContextMenuControlEntry entry) {
-  auto* self = this;
-  const std::weak_ptr<bool> alive = m_alive;
-  auto onActivate = m_onActivate;
-  DeferredCall::callLater([self, alive, onActivate = std::move(onActivate), entry = std::move(entry)] {
+  auto* self = rootMenu();
+  const std::weak_ptr<bool> alive = self->m_alive;
+  const std::weak_ptr<bool> sourceAlive = m_alive;
+  auto onActivate = self->m_onActivate;
+  DeferredCall::callLater([self, alive, sourceAlive, onActivate = std::move(onActivate), entry = std::move(entry)] {
     const auto token = alive.lock();
-    if (token == nullptr || !*token) {
+    const auto sourceToken = sourceAlive.lock();
+    if (token == nullptr || !*token || sourceToken == nullptr || !*sourceToken) {
       return;
     }
     // Close before running the action. The action may open another popup (e.g. the
@@ -256,11 +329,13 @@ void ContextMenuPopup::deferActivation(ContextMenuControlEntry entry) {
 }
 
 void ContextMenuPopup::deferClose() {
-  auto* self = this;
-  const std::weak_ptr<bool> alive = m_alive;
-  DeferredCall::callLater([self, alive] {
+  auto* self = rootMenu();
+  const std::weak_ptr<bool> alive = self->m_alive;
+  const std::weak_ptr<bool> sourceAlive = m_alive;
+  DeferredCall::callLater([self, alive, sourceAlive] {
     const auto token = alive.lock();
-    if (token != nullptr && *token) {
+    const auto sourceToken = sourceAlive.lock();
+    if (token != nullptr && *token && sourceToken != nullptr && *sourceToken) {
       self->close();
     }
   });
@@ -283,11 +358,25 @@ void ContextMenuPopup::setShadowConfig(const ShadowStyle& shadow) {
 }
 
 bool ContextMenuPopup::onPointerEvent(const PointerEvent& event) {
+  if (m_parentMenu == nullptr && event.type == PointerEvent::Type::Button
+      && m_swallowButton == event.button && !event.pressed) {
+    m_swallowButton = 0;
+    return true;
+  }
   if (!isOpen()) {
     return false;
   }
-
   const bool captured = m_inputDispatcher.pointerCaptured();
+  if (m_child && (m_child->hasPointerCapture() || (!captured && m_child->containsSurface(event.surface)))) {
+    return m_child->onPointerEvent(event);
+  }
+  if (m_parentMenu == nullptr && event.type == PointerEvent::Type::Button
+      && event.pressed && !containsSurface(event.surface)) {
+    m_swallowButton = event.button;
+    close();
+    return true;
+  }
+
   const bool onPopup = (event.surface != nullptr && event.surface == m_wlSurface);
   auto localX = static_cast<float>(event.sx);
   auto localY = static_cast<float>(event.sy);
@@ -295,14 +384,31 @@ bool ContextMenuPopup::onPointerEvent(const PointerEvent& event) {
   // parent surface are translated into popup-local coordinates so the drag keeps tracking instead
   // of being cut off at the popup edge.
   bool mapped = onPopup;
-  if (!onPopup
-      && captured
-      && m_surface != nullptr
-      && event.surface != nullptr
-      && event.surface == m_pointerParentSurface) {
-    localX -= static_cast<float>(m_surface->configuredX());
-    localY -= static_cast<float>(m_surface->configuredY());
-    mapped = true;
+  if (!onPopup && captured && event.surface != nullptr) {
+    float offsetX = 0.0F;
+    float offsetY = 0.0F;
+    for (auto* level = this; level != nullptr && level->m_surface != nullptr; level = level->m_parentMenu) {
+      offsetX += static_cast<float>(level->m_surface->configuredX());
+      offsetY += static_cast<float>(level->m_surface->configuredY());
+      if (event.surface == level->m_pointerParentSurface) {
+        localX -= offsetX;
+        localY -= offsetY;
+        mapped = true;
+        break;
+      }
+    }
+    offsetX = 0.0F;
+    offsetY = 0.0F;
+    for (auto* level = m_child.get(); !mapped && level != nullptr && level->m_surface != nullptr;
+         level = level->m_child.get()) {
+      offsetX += static_cast<float>(level->m_surface->configuredX());
+      offsetY += static_cast<float>(level->m_surface->configuredY());
+      if (event.surface == level->m_wlSurface) {
+        localX += offsetX;
+        localY += offsetY;
+        mapped = true;
+      }
+    }
   }
 
   switch (event.type) {
@@ -326,7 +432,7 @@ bool ContextMenuPopup::onPointerEvent(const PointerEvent& event) {
     }
     break;
   case PointerEvent::Type::Motion:
-    if (mapped || m_pointerInside) {
+    if (mapped || (event.surface == nullptr && m_pointerInside)) {
       if (onPopup) {
         m_pointerInside = true;
       }
@@ -335,7 +441,7 @@ bool ContextMenuPopup::onPointerEvent(const PointerEvent& event) {
     }
     break;
   case PointerEvent::Type::Button:
-    if (mapped || m_pointerInside) {
+    if (mapped || (event.surface == nullptr && m_pointerInside)) {
       if (onPopup) {
         m_pointerInside = true;
       }
@@ -349,7 +455,7 @@ bool ContextMenuPopup::onPointerEvent(const PointerEvent& event) {
     }
     break;
   case PointerEvent::Type::Axis:
-    if (onPopup || m_pointerInside) {
+    if (onPopup || (event.surface == nullptr && m_pointerInside)) {
       if (onPopup) {
         m_pointerInside = true;
       }
@@ -380,6 +486,10 @@ void ContextMenuPopup::onKeyboardEvent(const KeyboardEvent& event) {
   if (!isOpen() || !event.pressed || event.preedit) {
     return;
   }
+  if (m_child && m_child->isOpen()) {
+    m_child->onKeyboardEvent(event);
+    return;
+  }
 
   const std::uint32_t sym = event.sym;
   const std::uint32_t modifiers = event.modifiers;
@@ -389,10 +499,24 @@ void ContextMenuPopup::onKeyboardEvent(const KeyboardEvent& event) {
     return;
   }
 
+  if (KeySymbol::isLeft(sym) && m_parentMenu != nullptr) {
+    close();
+    return;
+  }
+
   if (m_menu == nullptr) {
     return;
   }
 
+  if (KeySymbol::isRight(sym)) {
+    const auto index = m_menu->highlightedIndex();
+    if (m_level != nullptr && index < m_level->size() && !(*m_level)[index].children.empty()) {
+      auto row = static_cast<const ContextMenuControlEntry&>((*m_level)[index]);
+      row.id = static_cast<std::int32_t>(index);
+      openSubmenu(row, (m_menu->rowTop(index) + m_menu->rowBottom(index)) * 0.5F);
+    }
+    return;
+  }
   if (KeybindMatcher::matches(KeybindAction::Down, sym, modifiers)) {
     if (m_menu->moveHighlight(1)) {
       m_highlightedIndex = m_menu->highlightedIndex();
@@ -457,7 +581,11 @@ bool ContextMenuPopup::dispatchKeyboardEvent(const KeyboardEvent& event) {
   if (s_openMenu == nullptr || !s_openMenu->isOpen()) {
     return false;
   }
-  s_openMenu->onKeyboardEvent(event);
+  auto* target = s_openMenu;
+  while (target->m_child && target->m_child->isOpen()) {
+    target = target->m_child.get();
+  }
+  target->onKeyboardEvent(event);
   return true;
 }
 
@@ -470,3 +598,59 @@ xdg_surface* ContextMenuPopup::xdgSurface() const noexcept {
 std::uint32_t ContextMenuPopup::width() const noexcept { return m_surface != nullptr ? m_surface->width() : 0; }
 
 std::uint32_t ContextMenuPopup::height() const noexcept { return m_surface != nullptr ? m_surface->height() : 0; }
+
+ContextMenuPopup* ContextMenuPopup::rootMenu() noexcept {
+  auto* root = this;
+  while (root->m_parentMenu != nullptr) {
+    root = root->m_parentMenu;
+  }
+  return root;
+}
+
+bool ContextMenuPopup::containsSurface(wl_surface* surface) const noexcept {
+  return surface != nullptr && ((isOpen() && surface == m_wlSurface)
+      || (m_child && m_child->containsSurface(surface)));
+}
+
+void ContextMenuPopup::openSubmenu(const ContextMenuControlEntry& entry, float rowCenterY) {
+  const auto index = static_cast<std::size_t>(entry.id);
+  if (m_level == nullptr || index >= m_level->size() || (*m_level)[index].children.empty()
+      || !entry.enabled || m_surface == nullptr || m_scrollView == nullptr) {
+    return;
+  }
+  if (m_child && m_child->isOpen() && m_childIndex == index) {
+    return;
+  }
+  m_child.reset();
+  m_childIndex = index;
+  auto request = m_childRequest;
+  request.initialHighlight = static_cast<std::size_t>(-1);
+  request.parent.xdgSurface = xdgSurface();
+  request.parent.attach = nullptr;
+  request.parent.keyboardGrab = {};
+  request.pointerParentSurface = m_wlSurface;
+  request.anchor = {
+      .x = static_cast<std::int32_t>(m_scrollView->x()),
+      .y = static_cast<std::int32_t>(m_scrollView->y() + rowCenterY - m_scrollView->scrollOffset()),
+      .width = std::max(1, static_cast<std::int32_t>(m_scrollView->width())),
+      .height = 1,
+  };
+  request.placement = ContextMenuPopupPlacement{
+      .anchor = XDG_POSITIONER_ANCHOR_RIGHT,
+      .gravity = XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT,
+      .chromeAttachment = {
+          .horizontal = popup_chrome::HorizontalAttachment::Left,
+          .vertical = popup_chrome::VerticalAttachment::Top,
+      },
+  };
+  m_child = std::make_unique<ContextMenuPopup>(m_wayland, m_renderContext);
+  m_child->m_parentMenu = this;
+  m_child->m_ownedMenu = m_ownedMenu;
+  m_child->m_level = &(*m_level)[index].children;
+  m_child->setShadowConfig(m_shadowConfig);
+  m_child->open(std::move(request));
+}
+
+bool ContextMenuPopup::hasPointerCapture() const noexcept {
+  return m_inputDispatcher.pointerCaptured() || (m_child && m_child->hasPointerCapture());
+}

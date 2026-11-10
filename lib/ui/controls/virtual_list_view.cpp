@@ -184,7 +184,8 @@ void VirtualListView::doLayout(Renderer& renderer) {
   // Match ScrollView's configured gutter behavior.
   recomputeMetrics(renderer, innerW);
   float viewportW = innerW;
-  if (m_scroll->reservesScrollbarGutter() || m_virtualHeight > viewportH + 0.5F) {
+  if (m_scroll->reservesScrollbarGutter()
+      || (m_scroll->scrollbarVisible() && m_virtualHeight > viewportH + 0.5F)) {
     viewportW = std::max(0.0F, innerW - scrollbarGutter);
     recomputeMetrics(renderer, viewportW);
   }

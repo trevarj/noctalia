@@ -38,6 +38,8 @@ public:
   // viewport, under the same layout-time semantics. Ignored once the node has
   // left content(), so callers need not clear it when they drop the node.
   void requestScrollIntoView(const Node* target);
+  // Discard layout-time requests without changing the current offset or running scroll animation.
+  void cancelPendingScrollRequests();
   void scrollBy(float delta);
   void setScrollbarVisible(bool visible);
   void setReserveScrollbarGutter(bool reserve);
@@ -72,6 +74,7 @@ public:
   float viewportPaddingH() const noexcept { return m_viewportPaddingH; }
   float viewportPaddingV() const noexcept { return m_viewportPaddingV; }
   bool reservesScrollbarGutter() const noexcept { return m_reserveScrollbarGutter; }
+  bool scrollbarVisible() const noexcept { return m_showScrollbar; }
   // Width reserved for the vertical scrollbar plus its gap, at the current content scale.
   float scrollbarGutter() const noexcept;
   float contentScale() const noexcept { return m_contentScale; }

@@ -20,6 +20,7 @@ public:
   struct TabFocusSnapshot {
     std::optional<std::size_t> index;
     std::optional<std::string> key;
+    std::optional<std::string> fallbackKey;
   };
 
   InputDispatcher() = default;
@@ -64,9 +65,18 @@ public:
   InputArea* lastTabFocusUnder(Node* subtree) const;
   InputArea* focusedArea() const noexcept { return m_focusedArea; }
   InputArea* hoveredArea() const noexcept { return m_hoveredArea; }
+  InputArea* capturedArea() const noexcept { return m_capturedArea; }
   bool pointerCaptured() const noexcept { return m_capturedArea != nullptr; }
+  // Original leaf awaiting native replay; null after invalidation or scroll takeover.
+  InputArea* pendingTouchPressArea() const noexcept {
+    return m_touchGesture.pending && !m_touchGesture.passivePress ? m_touchGesture.originalArea : nullptr;
+  }
 
 private:
+  bool pointerButton(
+      float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
+      bool touch, InputArea* expectedArea
+  );
   InputArea* findInputAreaAt(float x, float y);
   bool isAttachedToScene(const InputArea* area) const;
   void pruneDetachedAreas();
@@ -78,14 +88,17 @@ private:
 
   struct TouchScrollGesture {
     bool pending = false;
+    bool passivePress = false;
     float pressX = 0.0F;
     float pressY = 0.0F;
     std::uint32_t button = 0;
     std::uint32_t serial = 0;
     std::uint32_t time = 0;
+    InputArea* originalArea = nullptr;
     InputArea* verticalArea = nullptr;
     InputArea* horizontalArea = nullptr;
   };
+  bool replayTouchPress(const TouchScrollGesture& gesture, bool retainReleaseOnFailure);
 
   Node* m_sceneRoot = nullptr;
   CursorShapeCallback m_cursorShapeCallback;
@@ -104,8 +117,7 @@ private:
   // stationary pointer cannot take over the rest of the gesture.
   InputArea* m_axisGestureArea = nullptr;
   std::chrono::steady_clock::time_point m_lastAxisTime;
-  std::optional<std::size_t> m_stashedTabFocusIndex;
-  std::optional<std::string> m_stashedTabFocusKey;
+  TabFocusSnapshot m_stashedTabFocus;
   std::uint32_t m_lastSerial = 0;
   float m_lastPointerX = 0.0F;
   float m_lastPointerY = 0.0F;

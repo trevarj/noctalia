@@ -19,7 +19,10 @@ enum class ContextSubmenuDirection : std::uint8_t {
 
 struct ContextMenuControlEntry {
   std::int32_t id = 0;
+  std::size_t value = static_cast<std::size_t>(-1);
   std::string label;
+  // Native glyph name from the installed Tabler catalog.
+  std::string icon;
   bool enabled = true;
   bool separator = false;
   // Non-interactive group heading; entries below it read as members of the group.
@@ -34,8 +37,15 @@ struct ContextMenuControlEntry {
   std::optional<ColorSpec> indicatorColor;
   ColorSwatchPreview swatchPreview;
   TextEllipsize ellipsize = TextEllipsize::End;
+  // Explicit trusted preview only; label remains the plain logical/accessibility text.
+  std::string markupPreview;
 
   bool hasToggle() const noexcept { return checkmark || radio; }
+};
+
+// Only open popup levels copy presentation rows; descendants stay in the owned tree.
+struct ContextMenuEntry : ContextMenuControlEntry {
+  std::vector<ContextMenuEntry> children;
 };
 
 class ContextMenuControl : public Node {
@@ -50,6 +60,7 @@ public:
   void setSubmenuDirection(ContextSubmenuDirection direction);
   void setOnActivate(std::function<void(const ContextMenuControlEntry&)> onActivate);
   void setOnSubmenuOpen(std::function<void(const ContextMenuControlEntry&, float rowCenterY)> onSubmenuOpen);
+  void setOnHighlightChanged(std::function<void(const ContextMenuControlEntry&)> onHighlightChanged);
   void setRedrawCallback(std::function<void()> redrawCallback);
 
   void setHighlightedIndex(std::size_t index);
@@ -94,5 +105,6 @@ private:
   bool m_reserveToggleSpace = false;
   std::function<void(const ContextMenuControlEntry&)> m_onActivate;
   std::function<void(const ContextMenuControlEntry&, float rowCenterY)> m_onSubmenuOpen;
+  std::function<void(const ContextMenuControlEntry&)> m_onHighlightChanged;
   std::function<void()> m_redrawCallback;
 };

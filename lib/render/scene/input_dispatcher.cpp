@@ -162,13 +162,30 @@ void InputDispatcher::pointerMotion(float x, float y, std::uint32_t serial) {
     const float dx = x - m_touchGesture.pressX;
     const float dy = y - m_touchGesture.pressY;
     if (std::max(std::abs(dx), std::abs(dy)) < kTouchScrollSlop) {
+      if (m_touchGesture.passivePress) {
+        pruneDetachedAreas();
+        if (m_capturedArea != nullptr) {
+          float localX = 0.0F;
+          float localY = 0.0F;
+          Node::mapFromScene(m_capturedArea, x, y, localX, localY);
+          m_capturedArea->dispatchMotion(localX, localY);
+          updateCursor(m_lastSerial);
+        }
+      }
       return;
     }
 
     pruneDetachedAreas();
+    if (!m_touchGesture.passivePress && m_touchGesture.originalArea == nullptr) {
+      return; // Retain ownership of the invalidated stream until its release.
+    }
     InputArea* area = std::abs(dy) >= std::abs(dx) ? m_touchGesture.verticalArea : m_touchGesture.horizontalArea;
     auto gesture = std::exchange(m_touchGesture, {});
     if (area != nullptr) {
+      if (gesture.passivePress && m_capturedArea != nullptr) {
+        auto* child = std::exchange(m_capturedArea, nullptr);
+        child->dispatchCancel();
+      }
       m_capturedArea = area;
       trackArea(area);
       float localX = 0.0F;
@@ -177,8 +194,13 @@ void InputDispatcher::pointerMotion(float x, float y, std::uint32_t serial) {
       area->dispatchPress(
           localX, localY, gesture.button, true, gesture.pressX, gesture.pressY, gesture.serial, gesture.time
       );
+    } else if (!gesture.passivePress) {
+      if (!replayTouchPress(gesture, true)) {
+        return;
+      }
     } else {
-      pointerButton(gesture.pressX, gesture.pressY, gesture.button, true, gesture.serial, gesture.time, false);
+      gesture.pending = false;
+      m_touchGesture = gesture; // Keep the original capture; a passive press must never be replayed.
     }
   }
 
@@ -188,11 +210,50 @@ void InputDispatcher::pointerMotion(float x, float y, std::uint32_t serial) {
 bool InputDispatcher::pointerButton(
     float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time, bool touch
 ) {
-  if (m_touchGesture.pending && pressed) {
+  return pointerButton(x, y, button, pressed, serial, time, touch, nullptr);
+}
+
+bool InputDispatcher::replayTouchPress(const TouchScrollGesture& gesture, bool retainReleaseOnFailure) {
+  if (gesture.originalArea == nullptr) {
+    return false;
+  }
+  // Keep the tracked identity live across focus callbacks inside native press dispatch.
+  m_touchGesture = gesture;
+  pointerButton(
+      gesture.pressX, gesture.pressY, gesture.button, true, gesture.serial, gesture.time, false, gesture.originalArea
+  );
+  const bool ownsReplay = m_touchGesture.pending
+      && (m_touchGesture.originalArea == gesture.originalArea || m_touchGesture.originalArea == nullptr);
+  const bool capturedOriginal = ownsReplay && m_touchGesture.originalArea == gesture.originalArea
+      && m_capturedArea == gesture.originalArea;
+  if (ownsReplay) {
+    if (!capturedOriginal && retainReleaseOnFailure) {
+      m_touchGesture.originalArea = nullptr;
+      m_touchGesture.verticalArea = nullptr;
+      m_touchGesture.horizontalArea = nullptr;
+    } else {
+      m_touchGesture = {};
+    }
+  }
+  return capturedOriginal;
+}
+
+bool InputDispatcher::pointerButton(
+    float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
+    bool touch, InputArea* expectedArea
+) {
+  bool passiveRelease = false;
+  const bool trackingTouch = expectedArea == nullptr && (m_touchGesture.pending || m_touchGesture.passivePress);
+  if (trackingTouch && pressed) {
     m_touchGesture = {};
-  } else if (m_touchGesture.pending && button == m_touchGesture.button) {
+  } else if (trackingTouch && button == m_touchGesture.button) {
     auto gesture = std::exchange(m_touchGesture, {});
-    pointerButton(gesture.pressX, gesture.pressY, gesture.button, true, gesture.serial, gesture.time, false);
+    passiveRelease = gesture.passivePress;
+    if (!passiveRelease) {
+      if (!replayTouchPress(gesture, false)) {
+        return true; // Consume the original release; never activate a replacement leaf.
+      }
+    }
   }
   if (serial != 0) {
     m_lastSerial = serial;
@@ -205,6 +266,10 @@ bool InputDispatcher::pointerButton(
   }
 
   pruneDetachedAreas();
+  if (passiveRelease && m_capturedArea == nullptr) {
+    updateHover(x, y, m_lastSerial);
+    return true; // The original passive target disappeared; never release a replacement.
+  }
 
   InputArea* target = m_capturedArea;
   if (target == nullptr) {
@@ -223,6 +288,14 @@ bool InputDispatcher::pointerButton(
     if (target == nullptr) {
       target = inputAreaAcceptingButton(m_hoveredArea, button);
     }
+  }
+  const auto expectedTargetValid = [&] {
+    return expectedArea == nullptr
+        || (m_touchGesture.originalArea == expectedArea && target == expectedArea
+            && inputAreaAcceptingButton(findInputAreaAt(x, y), button) == expectedArea);
+  };
+  if (!expectedTargetValid()) {
+    return false;
   }
 
   if (touch && pressed && target != nullptr) {
@@ -243,13 +316,16 @@ bool InputDispatcher::pointerButton(
       }
     }
     if (verticalArea != nullptr || horizontalArea != nullptr) {
+      const bool passivePress = target->passiveTouchPress();
       m_touchGesture = TouchScrollGesture{
           .pending = true,
+          .passivePress = passivePress,
           .pressX = x,
           .pressY = y,
           .button = button,
           .serial = serial,
           .time = time,
+          .originalArea = passivePress ? nullptr : target,
           .verticalArea = verticalArea,
           .horizontalArea = horizontalArea,
       };
@@ -259,12 +335,17 @@ bool InputDispatcher::pointerButton(
       if (horizontalArea != nullptr) {
         trackArea(horizontalArea);
       }
-      return true;
+      if (m_touchGesture.originalArea != nullptr) {
+        trackArea(m_touchGesture.originalArea);
+      }
+      if (!m_touchGesture.passivePress) {
+        return true;
+      }
     }
   }
 
   if (target != nullptr) {
-    if (pressed && m_capturedArea == nullptr) {
+    if (pressed && m_capturedArea == nullptr && target->focusOnPointerPress()) {
       if (target != m_focusedArea && m_focusedArea != nullptr && target->focusable()) {
         setFocus(nullptr);
         pruneDetachedAreas();
@@ -273,13 +354,16 @@ bool InputDispatcher::pointerButton(
         if (target == nullptr) {
           target = inputAreaAcceptingButton(m_hoveredArea, button);
         }
-        if (target == nullptr) {
+        if (target == nullptr || !expectedTargetValid()) {
           return false;
         }
       }
       if (target->focusable()) {
         setFocus(target);
       }
+    }
+    if (!expectedTargetValid()) {
+      return false;
     }
 
     float localX = 0.0F;
@@ -300,7 +384,8 @@ bool InputDispatcher::pointerButton(
       updateHover(x, y, m_lastSerial);
       // Pointer clicks on switches and buttons should not leave keyboard focus behind.
       // Settings rebuilds restore stashed focus and can land on the wrong control.
-      if (m_focusedArea == target && target->textInputClient() == nullptr && !target->retainsFocusOnPointerRelease()) {
+      if (m_focusedArea == target && target->focusOnPointerPress() && target->textInputClient() == nullptr
+          && !target->retainsFocusOnPointerRelease()) {
         setFocus(nullptr);
       }
     }
@@ -490,16 +575,30 @@ bool InputDispatcher::cycleTabFocus(bool reverse) {
   return true;
 }
 
-void InputDispatcher::stashTabFocus() {
-  TabFocusSnapshot snapshot = captureTabFocus();
-  m_stashedTabFocusIndex = snapshot.index;
-  m_stashedTabFocusKey = std::move(snapshot.key);
-}
+void InputDispatcher::stashTabFocus() { m_stashedTabFocus = captureTabFocus(); }
 
 InputDispatcher::TabFocusSnapshot InputDispatcher::captureTabFocus() const {
   TabFocusSnapshot snapshot;
   if (m_sceneRoot == nullptr || m_focusedArea == nullptr) {
     return snapshot;
+  }
+
+  InputArea* fallback = nullptr;
+  for (Node* node = m_focusedArea->parent(); node != nullptr; node = node->parent()) {
+    if (node->excludeSubtreeFromTabOrder()) {
+      fallback = nullptr;
+    } else if (fallback == nullptr) {
+      auto* area = dynamic_cast<InputArea*>(node);
+      if (isTabFocusTarget(area) && !area->tabFocusKey().empty()) {
+        fallback = area;
+      }
+    }
+    if (node == m_sceneRoot) {
+      if (fallback != nullptr) {
+        snapshot.fallbackKey = std::string(fallback->tabFocusKey());
+      }
+      break;
+    }
   }
 
   if (!m_focusedArea->tabFocusKey().empty()) {
@@ -523,13 +622,7 @@ InputDispatcher::TabFocusSnapshot InputDispatcher::captureTabFocus() const {
 }
 
 void InputDispatcher::restoreStashedTabFocus() {
-  TabFocusSnapshot snapshot{
-      .index = m_stashedTabFocusIndex,
-      .key = std::move(m_stashedTabFocusKey),
-  };
-  m_stashedTabFocusIndex.reset();
-  m_stashedTabFocusKey.reset();
-  restoreTabFocus(std::move(snapshot));
+  restoreTabFocus(std::exchange(m_stashedTabFocus, {}));
 }
 
 void InputDispatcher::restoreTabFocus(TabFocusSnapshot snapshot) {
@@ -544,22 +637,31 @@ void InputDispatcher::restoreTabFocus(TabFocusSnapshot snapshot) {
     return;
   }
 
-  if (snapshot.key.has_value()) {
-    const auto it = std::ranges::find_if(order, [key = *snapshot.key](const InputArea* area) {
-      return area != nullptr && area->tabFocusKey() == key;
+  auto focusKey = [this, &order](const std::optional<std::string>& key) {
+    if (!key.has_value()) {
+      return false;
+    }
+    const auto it = std::ranges::find_if(order, [&key](const InputArea* area) {
+      return area != nullptr && area->tabFocusKey() == *key;
     });
-    if (it != order.end()) {
-      setFocus(*it);
+    if (it == order.end()) {
+      return false;
+    }
+    setFocus(*it);
+    return true;
+  };
+  if (snapshot.key.has_value()) {
+    if (!focusKey(snapshot.key)) {
+      focusKey(snapshot.fallbackKey);
     }
     return;
   }
-
-  if (!snapshot.index.has_value()) {
+  if (snapshot.index.has_value()) {
+    const std::size_t index = std::min(*snapshot.index, order.size() - 1);
+    setFocus(order[index]);
     return;
   }
-
-  const std::size_t index = std::min(*snapshot.index, order.size() - 1);
-  setFocus(order[index]);
+  focusKey(snapshot.fallbackKey);
 }
 
 void InputDispatcher::setFocus(InputArea* area) {
@@ -648,8 +750,18 @@ void InputDispatcher::updateHover(float x, float y, std::uint32_t serial) {
 bool InputDispatcher::isAttachedToScene(const InputArea* area) const { return nodeAttachedToRoot(area, m_sceneRoot); }
 
 void InputDispatcher::pruneDetachedAreas() {
+  if (m_touchGesture.originalArea != nullptr && !isAttachedToScene(m_touchGesture.originalArea)) {
+    m_touchGesture.originalArea = nullptr;
+    m_touchGesture.verticalArea = nullptr;
+    m_touchGesture.horizontalArea = nullptr;
+  }
   if (m_capturedArea != nullptr && !isAttachedToScene(m_capturedArea)) {
-    cancelPointerCapture();
+    if (m_touchGesture.passivePress) {
+      auto* child = std::exchange(m_capturedArea, nullptr);
+      child->dispatchCancel(); // Cancel only the passive tap, retaining its pending scroll viewport.
+    } else {
+      cancelPointerCapture();
+    }
   }
   if (m_touchGesture.verticalArea != nullptr && !isAttachedToScene(m_touchGesture.verticalArea)) {
     m_touchGesture.verticalArea = nullptr;
@@ -682,6 +794,12 @@ void InputDispatcher::pruneDetachedAreas() {
 void InputDispatcher::trackArea(InputArea* area) {
   area->setDestroyCallback([this](InputArea* a) {
     const bool ownedCursor = m_hoveredArea == a || m_capturedArea == a;
+    if (m_touchGesture.originalArea == a) {
+      // Keep the pending button metadata so its later release cannot hit a replacement.
+      m_touchGesture.originalArea = nullptr;
+      m_touchGesture.verticalArea = nullptr;
+      m_touchGesture.horizontalArea = nullptr;
+    }
     if (m_capturedArea == a) {
       m_capturedArea = nullptr;
     }

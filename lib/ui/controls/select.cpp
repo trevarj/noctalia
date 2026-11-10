@@ -216,6 +216,10 @@ void Select::setOptionIndicators(std::vector<ColorSpec> colors) {
   markLayoutDirty();
 }
 
+void Select::setOptionIcons(std::vector<std::string> icons) {
+  m_optionIcons = std::move(icons);
+}
+
 void Select::setColorSwatchPreviews(std::vector<ColorSwatchPreview> previews) {
   m_optionSwatchPreviews = std::move(previews);
   markLayoutDirty();
@@ -460,6 +464,7 @@ void Select::openPopupDropdown() {
       .maxMenuWidth = maxMenuWidth,
       .fontSize = m_fontSize,
       .options = m_options,
+      .optionIcons = m_optionIcons,
       .indicatorColors = m_indicatorColors,
       .optionSwatchPreviews = m_optionSwatchPreviews,
       .selectedIndex = m_selectedIndex,

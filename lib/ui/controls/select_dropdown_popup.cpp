@@ -57,19 +57,22 @@ void SelectDropdownPopup::openSelectDropdown(const DropdownRequest& request, Dro
         ContextMenuControlEntry{
             .id = static_cast<std::int32_t>(i),
             .label = request.options[i],
-            .checkmark = true,
+            .icon = i < request.optionIcons.size() ? request.optionIcons[i] : std::string{},
+            .radio = true,
             .toggleState = i == request.selectedIndex ? 1 : 0,
             .indicatorColor = i < request.indicatorColors.size() ? std::optional<ColorSpec>(request.indicatorColors[i])
                                                                  : std::nullopt,
             .swatchPreview =
                 i < request.optionSwatchPreviews.size() ? request.optionSwatchPreviews[i] : ColorSwatchPreview{},
+            .markupPreview = i < request.optionMarkupPreviews.size() ? request.optionMarkupPreviews[i] : std::string{},
         }
     );
   }
 
   m_popup.setOnActivate([onSelect = std::move(callbacks.onSelect)](const ContextMenuControlEntry& entry) {
     if (onSelect) {
-      onSelect(static_cast<std::size_t>(std::max<std::int32_t>(0, entry.id)));
+      onSelect(entry.value != static_cast<std::size_t>(-1)
+          ? entry.value : static_cast<std::size_t>(std::max<std::int32_t>(0, entry.id)));
     }
   });
   m_popup.setOnDismissed([onDismiss = std::move(callbacks.onDismiss)] {
@@ -85,6 +88,7 @@ void SelectDropdownPopup::openSelectDropdown(const DropdownRequest& request, Dro
   m_popup.open(
       ContextMenuPopupRequest{
           .entries = std::move(entries),
+          .menu = request.menu,
           .minMenuWidth = request.menuWidth,
           .maxMenuWidth = std::max(request.menuWidth, request.maxMenuWidth),
           .contentScale = contentScale,
@@ -106,6 +110,8 @@ void SelectDropdownPopup::openSelectDropdown(const DropdownRequest& request, Dro
                   .output = m_parentOutput,
               },
           .pointerParentSurface = m_parentWlSurface,
+          .inputSerial = request.inputSerial,
+          .pointerContextMenu = request.pointerContextMenu,
       }
   );
 }

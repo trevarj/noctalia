@@ -357,6 +357,12 @@ void ScrollView::requestScrollIntoView(const Node* target) {
   markLayoutDirty();
 }
 
+void ScrollView::cancelPendingScrollRequests() {
+  m_pendingScrollOffset.reset();
+  m_pendingScrollToBottom = false;
+  m_pendingScrollIntoView = nullptr;
+}
+
 void ScrollView::setContentScale(float scale) {
   const float clamped = std::max(0.1F, scale);
   if (m_contentScale == clamped) {

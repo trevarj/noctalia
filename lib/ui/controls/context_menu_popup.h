@@ -35,6 +35,7 @@ struct ContextMenuPopupPlacement {
 
 struct ContextMenuPopupRequest {
   std::vector<ContextMenuControlEntry> entries;
+  std::vector<ContextMenuEntry> menu;
   // <= 0 sizes the menu to its widest entry, clamped to [minMenuWidth, maxMenuWidth] (0 = unbounded).
   float menuWidth = 0.0F;
   float minMenuWidth = 0.0F;
@@ -54,6 +55,8 @@ struct ContextMenuPopupRequest {
   // callers retain the previous last-input-serial behavior.
   std::optional<std::uint32_t> inputSerial = std::nullopt;
   std::optional<ContextMenuPopupPlacement> placement = std::nullopt;
+  // Root pointer menu: anchor.x/y is the invocation point; encode shadow bleed before flips.
+  bool pointerContextMenu = false;
 };
 
 class ContextMenuPopup {
@@ -95,12 +98,23 @@ private:
   wl_surface* m_wlSurface = nullptr;
   wl_surface* m_pointerParentSurface = nullptr;
   bool m_pointerInside = false;
+  std::unique_ptr<ContextMenuPopup> m_child;
+  ContextMenuPopup* m_parentMenu = nullptr;
+  std::shared_ptr<const std::vector<ContextMenuEntry>> m_ownedMenu;
+  const std::vector<ContextMenuEntry>* m_level = nullptr;
+  std::size_t m_childIndex = static_cast<std::size_t>(-1);
+  ContextMenuPopupRequest m_childRequest;
+  std::uint32_t m_swallowButton = 0;
 
   void restoreParentKeyboardInteractivity();
   void ensureHighlightedVisible();
   void requestVisualUpdate();
   void deferActivation(ContextMenuControlEntry entry);
   void deferClose();
+  ContextMenuPopup* rootMenu() noexcept;
+  bool containsSurface(wl_surface* surface) const noexcept;
+  bool hasPointerCapture() const noexcept;
+  void openSubmenu(const ContextMenuControlEntry& entry, float rowCenterY);
 
   std::function<void(const ContextMenuControlEntry&)> m_onActivate;
   std::function<void()> m_onDismissed;

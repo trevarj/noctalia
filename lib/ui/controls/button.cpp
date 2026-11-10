@@ -207,6 +207,11 @@ Button::Button() {
       m_onPress(data.localX, data.localY, data.pressed);
     }
   });
+  area->setOnCancel([this] {
+    if (m_inputArea->passiveTouchPress()) {
+      applyVisualState();
+    }
+  });
   area->setOnMotion([this](const InputArea::PointerData& data) {
     if (m_onMotion) {
       m_onMotion();

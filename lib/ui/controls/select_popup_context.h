@@ -1,11 +1,13 @@
 #pragma once
 
 #include "ui/controls/color_swatch_preview.h"
+#include "ui/controls/context_menu.h"
 #include "ui/palette.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,10 +26,19 @@ public:
     // Drives the dropdown's row metrics (font, height, insets); pre-scaled by the caller.
     float fontSize = 0.0F;
     std::vector<std::string> options;
+    // Nonempty menu selects by leaf value, not row position. Branches have children and no action.
+    std::vector<ContextMenuEntry> menu;
+    std::vector<std::string> optionIcons;
     std::vector<ColorSpec> indicatorColors;
     std::vector<ColorSwatchPreview> optionSwatchPreviews;
+    // Trusted caller-supplied Pango markup; empty entries keep the plain option text.
+    std::vector<std::string> optionMarkupPreviews;
     std::size_t selectedIndex = static_cast<std::size_t>(-1);
     std::size_t maxVisibleOptions = 6;
+    // The initiating press serial, rather than the later release that opens the menu.
+    std::optional<std::uint32_t> inputSerial = std::nullopt;
+    // Pointer menus attach at anchorX/Y, including when the compositor flips their direction.
+    bool pointerContextMenu = false;
   };
 
   struct DropdownCallbacks {
